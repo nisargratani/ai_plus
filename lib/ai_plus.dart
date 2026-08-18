@@ -12,7 +12,7 @@
 /// );
 /// print(response.text);
 /// ```
-library ai_plus;
+library;
 
 // Core Abstractions
 export 'src/core/ai_client.dart';

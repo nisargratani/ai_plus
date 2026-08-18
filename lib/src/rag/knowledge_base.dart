@@ -1,3 +1,5 @@
+// ignore_for_file: prefer_initializing_formals
+
 import '../core/ai_client.dart';
 import '../models/ai_message.dart';
 import '../core/ai_response.dart';
