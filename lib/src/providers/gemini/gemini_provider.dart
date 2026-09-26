@@ -1,41 +1,62 @@
 import 'dart:convert';
+
+import '../../core/ai_capabilities.dart';
 import '../../core/ai_provider.dart';
 import '../../core/ai_request.dart';
 import '../../core/ai_response.dart';
 import '../../core/ai_stream.dart';
-import '../../core/ai_capabilities.dart';
-import '../../models/ai_message.dart';
-import '../../models/ai_content.dart';
-import '../../models/ai_usage.dart';
-import '../../models/ai_finish_reason.dart';
 import '../../embeddings/embedding.dart';
-import '../../http/ai_http_client.dart';
 import '../../errors/ai_exception.dart';
+import '../../http/ai_http_client.dart';
+import '../../models/ai_content.dart';
+import '../../models/ai_finish_reason.dart';
+import '../../models/ai_message.dart';
+import '../../models/ai_usage.dart';
+import '../closeable_provider.dart';
 
-/// An AI provider implementation for Google Gemini.
+/// An AI provider implementation for the Google Gemini API.
 ///
-/// Supports chat, streaming, tool calling, multimodal input, and embeddings.
+/// Supports chat, streaming, tool calling, image and audio input,
+/// structured output and embeddings.
 ///
 /// ```dart
 /// final provider = AiProvider.gemini(apiKey: 'AIza...');
 /// ```
-class GeminiProvider implements AiProvider {
+///
+/// The API key is sent in the `x-goog-api-key` header (never in the URL).
+/// Defaults to the `gemini-flash-latest` model alias and the
+/// `gemini-embedding-001` embeddings model.
+class GeminiProvider implements AiProvider, CloseableProvider {
+  /// Creates a Gemini provider.
+  ///
+  /// [headers] are sent with every request. A [httpClient] passed in is not
+  /// closed by [close]; the caller owns it.
+  GeminiProvider({
+    required this.apiKey,
+    this.baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
+    Map<String, String> headers = const {},
+    AiHttpClient? httpClient,
+  })  : _headers = {'x-goog-api-key': apiKey, ...headers},
+        _ownsHttpClient = httpClient == null,
+        _httpClient = httpClient ?? AiHttpClient();
+
+  /// The model used when a request does not specify one.
+  static const defaultModel = 'gemini-flash-latest';
+
+  /// The embeddings model used when none is specified.
+  static const defaultEmbeddingModel = 'gemini-embedding-001';
+
+  static const _provider = 'Gemini';
+
   /// The API key for authentication.
   final String apiKey;
 
   /// The base URL for the Gemini API.
   final String baseUrl;
 
+  final Map<String, String> _headers;
   final AiHttpClient _httpClient;
-
-  /// Creates a Gemini provider.
-  ///
-  /// An optional [httpClient] can be provided for testing.
-  GeminiProvider({
-    required this.apiKey,
-    this.baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
-    AiHttpClient? httpClient,
-  }) : _httpClient = httpClient ?? AiHttpClient();
+  final bool _ownsHttpClient;
 
   @override
   AiCapabilities get capabilities => const AiCapabilities(
@@ -45,189 +66,178 @@ class GeminiProvider implements AiProvider {
         embeddings: true,
         imageInput: true,
         audioInput: true,
-        fileInput: false,
       );
 
   @override
   Future<AiResponse> chat(AiRequest request) async {
-    final model = request.model ?? 'gemini-2.0-flash';
-    final url = Uri.parse('$baseUrl/models/$model:generateContent?key=$apiKey');
-    final body = _buildRequestBody(request);
-
-    final result = await _httpClient.post(url, body: body);
+    final result = await _httpClient.post(
+      _modelUri(request.model ?? defaultModel, 'generateContent'),
+      headers: _headers,
+      body: _buildRequestBody(request),
+      provider: _provider,
+    );
     return _parseResponse(result);
   }
 
   @override
   Stream<AiStreamChunk> stream(AiRequest request) async* {
-    final model = request.model ?? 'gemini-2.0-flash';
-    final url = Uri.parse(
-        '$baseUrl/models/$model:streamGenerateContent?key=$apiKey&alt=sse');
-    final body = _buildRequestBody(request);
+    final data = _httpClient.postSse(
+      _modelUri(
+        request.model ?? defaultModel,
+        'streamGenerateContent',
+        query: const {'alt': 'sse'},
+      ),
+      headers: _headers,
+      body: _buildRequestBody(request),
+      provider: _provider,
+    );
 
-    final rawStream = _httpClient.postStream(url, body: body);
-
-    String buffer = '';
-
-    await for (final chunk in rawStream) {
-      buffer += chunk;
-      final lines = buffer.split('\n');
-      buffer = lines.removeLast();
-
-      for (final line in lines) {
-        final trimmed = line.trim();
-        if (trimmed.isEmpty) continue;
-        if (!trimmed.startsWith('data: ')) continue;
-
-        final data = trimmed.substring(6).trim();
-        if (data.isEmpty) continue;
-
-        try {
-          final json = jsonDecode(data) as Map<String, dynamic>;
-          yield _parseStreamChunk(json);
-        } catch (e) {
-          if (e is AiException) rethrow;
-          throw AiParsingException('Failed to parse Gemini stream chunk: $e',
-              provider: 'Gemini', rawResponse: data);
-        }
+    await for (final payload in data) {
+      final Map<String, dynamic> json;
+      try {
+        json = jsonDecode(payload) as Map<String, dynamic>;
+      } catch (e) {
+        throw AiParsingException(
+          'Failed to parse Gemini stream chunk: $e',
+          provider: _provider,
+          rawResponse: payload,
+        );
       }
+      final error = json['error'];
+      if (error != null) {
+        throw AiProviderException(
+          'Stream error: ${error is Map ? error['message'] : error}',
+          provider: _provider,
+        );
+      }
+      _throwIfPromptBlocked(json);
+      yield _parseStreamChunk(json);
     }
   }
 
   @override
-  Future<AiEmbeddingResult> embeddings(List<String> inputs,
-      {String? model}) async {
-    final defaultModel = model ?? 'text-embedding-004';
+  Future<AiEmbeddingResult> embeddings(
+    List<String> inputs, {
+    String? model,
+  }) async {
+    if (inputs.isEmpty) return const AiEmbeddingResult(embeddings: []);
 
-    if (inputs.length == 1) {
-      final url =
-          Uri.parse('$baseUrl/models/$defaultModel:embedContent?key=$apiKey');
-      final body = <String, dynamic>{
-        'model': 'models/$defaultModel',
-        'content': {
-          'parts': [
-            {'text': inputs.first}
-          ]
-        }
-      };
+    final modelPath = _modelPath(model ?? defaultEmbeddingModel);
+    Map<String, dynamic> requestFor(String input) => {
+          'model': modelPath,
+          'content': {
+            'parts': [
+              {'text': input},
+            ],
+          },
+        };
 
-      final result = await _httpClient.post(url, body: body);
+    final single = inputs.length == 1;
+    final result = await _httpClient.post(
+      _modelUri(modelPath, single ? 'embedContent' : 'batchEmbedContents'),
+      headers: _headers,
+      body: single
+          ? requestFor(inputs.first)
+          : {'requests': inputs.map(requestFor).toList()},
+      provider: _provider,
+    );
 
-      try {
-        final embeddingObj = result['embedding'] as Map<String, dynamic>;
-        final values = (embeddingObj['values'] as List)
-            .cast<num>()
-            .map((n) => n.toDouble())
-            .toList();
-        return AiEmbeddingResult(embeddings: [AiEmbedding(values)]);
-      } catch (e) {
-        if (e is AiException) rethrow;
-        throw AiParsingException(
-            'Failed to parse Gemini embedding response: $e',
-            provider: 'Gemini',
-            rawResponse: jsonEncode(result));
-      }
-    } else {
-      final url = Uri.parse(
-          '$baseUrl/models/$defaultModel:batchEmbedContents?key=$apiKey');
-      final requests = inputs
-          .map((input) => <String, dynamic>{
-                'model': 'models/$defaultModel',
-                'content': {
-                  'parts': [
-                    {'text': input}
-                  ]
-                }
-              })
-          .toList();
-
-      final result = await _httpClient.post(url, body: {'requests': requests});
-
-      try {
-        final embeddingsList = result['embeddings'] as List;
-        final embeddingsResult = embeddingsList.map((e) {
-          final values = (e['values'] as List)
-              .cast<num>()
-              .map((n) => n.toDouble())
-              .toList();
-          return AiEmbedding(values);
-        }).toList();
-        return AiEmbeddingResult(embeddings: embeddingsResult);
-      } catch (e) {
-        if (e is AiException) rethrow;
-        throw AiParsingException(
-            'Failed to parse Gemini batch embedding response: $e',
-            provider: 'Gemini',
-            rawResponse: jsonEncode(result));
-      }
+    try {
+      final raw = single
+          ? [result['embedding']]
+          : result['embeddings'] as List<dynamic>;
+      return AiEmbeddingResult(embeddings: [
+        for (final e in raw.cast<Map<String, dynamic>>())
+          AiEmbedding([
+            for (final n in e['values'] as List) (n as num).toDouble(),
+          ]),
+      ]);
+    } catch (e) {
+      throw AiParsingException(
+        'Failed to parse Gemini embeddings response: $e',
+        provider: _provider,
+        rawResponse: jsonEncode(result),
+      );
     }
+  }
+
+  /// Closes the HTTP client created by this provider.
+  ///
+  /// Called automatically by `AiClient.close`.
+  @override
+  void close() {
+    if (_ownsHttpClient) _httpClient.close();
   }
 
   // ── Private helpers ──────────────────────────────────────────────────
 
+  /// Accepts `gemini-x`, `models/gemini-x` and `tunedModels/x`.
+  static String _modelPath(String model) =>
+      model.contains('/') ? model : 'models/$model';
+
+  Uri _modelUri(
+    String model,
+    String method, {
+    Map<String, String>? query,
+  }) {
+    final base = baseUrl.endsWith('/')
+        ? baseUrl.substring(0, baseUrl.length - 1)
+        : baseUrl;
+    final uri = Uri.parse('$base/${_modelPath(model)}:$method');
+    return query == null ? uri : uri.replace(queryParameters: query);
+  }
+
   Map<String, dynamic> _buildRequestBody(AiRequest request) {
-    // Separate system messages from conversation messages
     final systemParts = <String>[];
-    final contentMessages = <Map<String, dynamic>>[];
+    final contents = <Map<String, dynamic>>[];
 
     for (final message in request.messages) {
       if (message.role == AiMessageRole.system ||
           message.role == AiMessageRole.developer) {
         systemParts.add(message.text);
       } else {
-        contentMessages.add(_mapMessage(message));
+        contents.add(_mapMessage(message));
       }
     }
 
-    final body = <String, dynamic>{
-      'contents': contentMessages,
-    };
+    final body = <String, dynamic>{'contents': contents};
 
     if (systemParts.isNotEmpty) {
       body['systemInstruction'] = {
         'parts': [
-          {'text': systemParts.join('\n')}
-        ]
+          {'text': systemParts.join('\n')},
+        ],
       };
     }
 
-    // Generation config
-    final generationConfig = <String, dynamic>{};
-    if (request.maxTokens != null) {
-      generationConfig['maxOutputTokens'] = request.maxTokens;
-    }
-    if (request.temperature != null) {
-      generationConfig['temperature'] = request.temperature;
-    }
-    if (request.topP != null) {
-      generationConfig['topP'] = request.topP;
-    }
-    if (request.stop != null) {
-      generationConfig['stopSequences'] = request.stop;
-    }
-
-    // Structured output via responseSchema
-    if (request.schema != null) {
+    final generationConfig = <String, dynamic>{
+      if (request.maxTokens != null) 'maxOutputTokens': request.maxTokens,
+      if (request.temperature != null) 'temperature': request.temperature,
+      if (request.topP != null) 'topP': request.topP,
+      if (request.stop != null) 'stopSequences': request.stop,
+    };
+    final schema = request.schema;
+    if (schema != null) {
       generationConfig['responseMimeType'] = 'application/json';
-      generationConfig['responseSchema'] = request.schema!.toJson();
+      generationConfig['responseSchema'] = schema.toJson();
     }
-
     if (generationConfig.isNotEmpty) {
       body['generationConfig'] = generationConfig;
     }
 
-    // Tool definitions
-    if (request.tools != null && request.tools!.isNotEmpty) {
+    final tools = request.tools;
+    if (tools != null && tools.isNotEmpty) {
       body['tools'] = [
         {
-          'functionDeclarations': request.tools!
-              .map((t) => {
-                    'name': t.name,
-                    'description': t.description,
-                    'parameters': t.parameters.toJson(),
-                  })
-              .toList(),
-        }
+          'functionDeclarations': [
+            for (final t in tools)
+              {
+                'name': t.name,
+                'description': t.description,
+                'parameters': t.parameters.toJson(),
+              },
+          ],
+        },
       ];
     }
 
@@ -235,7 +245,6 @@ class GeminiProvider implements AiProvider {
   }
 
   Map<String, dynamic> _mapMessage(AiMessage message) {
-    final role = _mapRole(message.role);
     final parts = <Map<String, dynamic>>[];
 
     for (final content in message.content) {
@@ -243,186 +252,174 @@ class GeminiProvider implements AiProvider {
         case AiTextContent(:final text):
           parts.add({'text': text});
         case AiImageContent(:final mimeType, :final bytes):
-          parts.add({
-            'inlineData': {
-              'mimeType': mimeType,
-              'data': base64Encode(bytes),
-            }
-          });
         case AiAudioContent(:final mimeType, :final bytes):
           parts.add({
-            'inlineData': {
-              'mimeType': mimeType,
-              'data': base64Encode(bytes),
-            }
+            'inlineData': {'mimeType': mimeType, 'data': base64Encode(bytes)},
           });
         case AiFileContent():
           throw const AiUnsupportedCapabilityException(
             'Generic file content is not supported by Gemini inline',
-            provider: 'Gemini',
+            provider: _provider,
           );
-        case AiToolCallContent(:final name, :final arguments):
+        case AiToolCallContent(:final id, :final name, :final arguments):
+          final signature = content.metadata['thoughtSignature'];
           parts.add({
             'functionCall': {
+              if (id != name) 'id': id,
               'name': name,
               'args': arguments,
-            }
+            },
+            // Gemini requires thought signatures to be echoed back verbatim.
+            if (signature != null) 'thoughtSignature': signature,
           });
-        case AiToolResultContent(:final name, :final result):
+        case AiToolResultContent(:final id, :final name, :final result):
           parts.add({
             'functionResponse': {
+              if (id != name) 'id': id,
               'name': name,
               'response':
                   result is Map<String, dynamic> ? result : {'result': result},
-            }
+            },
           });
       }
     }
 
-    if (parts.isEmpty) {
-      parts.add({'text': ''});
-    }
+    if (parts.isEmpty) parts.add({'text': ''});
 
     return {
-      'role': role,
+      // Gemini only accepts `user` and `model`; function responses are sent
+      // as `user` turns.
+      'role': message.role == AiMessageRole.assistant ? 'model' : 'user',
       'parts': parts,
     };
   }
 
-  String _mapRole(AiMessageRole role) {
-    switch (role) {
-      case AiMessageRole.user:
-        return 'user';
-      case AiMessageRole.assistant:
-        return 'model';
-      case AiMessageRole.tool:
-        return 'function';
-      case AiMessageRole.system:
-      case AiMessageRole.developer:
-        return 'user'; // Handled separately in _buildRequestBody
+  /// Gemini returns no candidates (HTTP 200) when the prompt itself is
+  /// blocked; surface that as a content-filter error, not a parsing error.
+  void _throwIfPromptBlocked(Map<String, dynamic> json) {
+    final candidates = json['candidates'] as List?;
+    if (candidates != null && candidates.isNotEmpty) return;
+    final feedback = json['promptFeedback'] as Map<String, dynamic>?;
+    final blockReason = feedback?['blockReason'];
+    if (blockReason != null) {
+      throw AiContentFilterException(
+        'Prompt blocked by Gemini: $blockReason',
+        provider: _provider,
+      );
     }
   }
 
   AiResponse _parseResponse(Map<String, dynamic> json) {
+    _throwIfPromptBlocked(json);
     try {
       final candidates = json['candidates'] as List?;
       if (candidates == null || candidates.isEmpty) {
-        throw const AiParsingException('No candidates returned by Gemini',
-            provider: 'Gemini');
+        throw AiParsingException(
+          'No candidates returned by Gemini',
+          provider: _provider,
+          rawResponse: jsonEncode(json),
+        );
       }
 
       final candidate = candidates.first as Map<String, dynamic>;
-      final message = _parseAssistantContent(candidate);
-
-      final usageJson = json['usageMetadata'] as Map<String, dynamic>?;
-      final usage = usageJson != null
-          ? AiUsage(
-              inputTokens: usageJson['promptTokenCount'] as int?,
-              outputTokens: usageJson['candidatesTokenCount'] as int?,
-              totalTokens: usageJson['totalTokenCount'] as int?,
-            )
-          : AiUsage.empty;
+      final content = _parseParts(candidate);
 
       return AiResponse(
-        message: message,
-        finishReason: _parseFinishReason(candidate['finishReason']),
-        usage: usage,
+        message: AiMessage(
+          role: AiMessageRole.assistant,
+          content: content.isEmpty ? [const AiTextContent('')] : content,
+        ),
+        finishReason: _parseFinishReason(candidate['finishReason'], content) ??
+            AiFinishReason.unknown,
+        usage: _parseUsage(json['usageMetadata']) ?? AiUsage.empty,
         raw: json,
       );
+    } on AiException {
+      rethrow;
     } catch (e) {
-      if (e is AiException) rethrow;
-      throw AiParsingException('Failed to parse Gemini response: $e',
-          provider: 'Gemini', rawResponse: jsonEncode(json));
+      throw AiParsingException(
+        'Failed to parse Gemini response: $e',
+        provider: _provider,
+        rawResponse: jsonEncode(json),
+      );
     }
   }
 
-  AiMessage _parseAssistantContent(Map<String, dynamic> candidate) {
+  List<AiContent> _parseParts(Map<String, dynamic> candidate) {
     final contentObj = candidate['content'] as Map<String, dynamic>?;
-    final parts = contentObj?['parts'] as List? ?? [];
-    final contentParts = <AiContent>[];
+    final parts = (contentObj?['parts'] as List?) ?? const [];
+    final result = <AiContent>[];
 
-    for (final part in parts) {
-      final partMap = part as Map<String, dynamic>;
+    for (final part in parts.cast<Map<String, dynamic>>()) {
+      // Thought summaries are not part of the answer.
+      if (part['thought'] == true) continue;
 
-      if (partMap.containsKey('text')) {
-        final text = partMap['text'] as String? ?? '';
-        if (text.isNotEmpty) {
-          contentParts.add(AiTextContent(text));
-        }
-      }
+      final text = part['text'] as String?;
+      if (text != null && text.isNotEmpty) result.add(AiTextContent(text));
 
-      if (partMap.containsKey('functionCall')) {
-        final fc = partMap['functionCall'] as Map<String, dynamic>;
-        contentParts.add(AiToolCallContent(
-          id: fc['name'] as String, // Gemini doesn't use separate IDs
-          name: fc['name'] as String,
+      final fc = part['functionCall'] as Map<String, dynamic>?;
+      if (fc != null) {
+        final name = fc['name'] as String;
+        final signature = part['thoughtSignature'];
+        result.add(AiToolCallContent(
+          // Older models do not return call ids; fall back to the name.
+          id: (fc['id'] as String?) ?? name,
+          name: name,
           arguments: (fc['args'] as Map<String, dynamic>?) ?? {},
+          metadata: signature != null ? {'thoughtSignature': signature} : {},
         ));
       }
     }
-
-    if (contentParts.isEmpty) {
-      contentParts.add(const AiTextContent(''));
-    }
-
-    return AiMessage(
-      role: AiMessageRole.assistant,
-      content: contentParts,
-    );
+    return result;
   }
 
   AiStreamChunk _parseStreamChunk(Map<String, dynamic> json) {
     final candidates = json['candidates'] as List?;
+    final usage = _parseUsage(json['usageMetadata']);
     if (candidates == null || candidates.isEmpty) {
-      return AiStreamChunk(raw: json);
+      return AiStreamChunk(usage: usage, raw: json);
     }
 
-    final candidate = candidates.first;
-    final contentObj = candidate['content'] as Map<String, dynamic>?;
-    final parts = contentObj?['parts'] as List? ?? [];
-    final contentParts = <AiContent>[];
-
-    for (final part in parts) {
-      final partMap = part as Map<String, dynamic>;
-      if (partMap.containsKey('text')) {
-        contentParts.add(AiTextContent(partMap['text'] as String? ?? ''));
-      }
-      if (partMap.containsKey('functionCall')) {
-        final fc = partMap['functionCall'] as Map<String, dynamic>;
-        contentParts.add(AiToolCallContent(
-          id: fc['name'] as String,
-          name: fc['name'] as String,
-          arguments: (fc['args'] as Map<String, dynamic>?) ?? {},
-        ));
-      }
-    }
-
-    final usageJson = json['usageMetadata'] as Map<String, dynamic>?;
-
+    final candidate = candidates.first as Map<String, dynamic>;
+    final content = _parseParts(candidate);
     return AiStreamChunk(
-      content: contentParts,
-      finishReason: _parseFinishReason(candidate['finishReason']),
-      usage: usageJson != null
-          ? AiUsage(
-              inputTokens: usageJson['promptTokenCount'] as int?,
-              outputTokens: usageJson['candidatesTokenCount'] as int?,
-              totalTokens: usageJson['totalTokenCount'] as int?,
-            )
-          : null,
+      content: content,
+      finishReason: _parseFinishReason(candidate['finishReason'], content),
+      usage: usage,
       raw: json,
     );
   }
 
-  AiFinishReason _parseFinishReason(dynamic reason) {
+  static AiUsage? _parseUsage(Object? json) {
+    if (json is! Map<String, dynamic>) return null;
+    return AiUsage(
+      inputTokens: json['promptTokenCount'] as int?,
+      outputTokens: json['candidatesTokenCount'] as int?,
+      totalTokens: json['totalTokenCount'] as int?,
+    );
+  }
+
+  static AiFinishReason? _parseFinishReason(
+    Object? reason,
+    List<AiContent> content,
+  ) {
+    if (reason == null) return null;
+    // Gemini reports `STOP` even when the turn ends with function calls.
+    if (content.any((c) => c is AiToolCallContent)) {
+      return AiFinishReason.toolCalls;
+    }
     switch (reason) {
       case 'STOP':
         return AiFinishReason.stop;
       case 'MAX_TOKENS':
         return AiFinishReason.length;
       case 'SAFETY':
-        return AiFinishReason.contentFilter;
       case 'RECITATION':
-        return AiFinishReason.unknown;
+      case 'BLOCKLIST':
+      case 'PROHIBITED_CONTENT':
+      case 'SPII':
+      case 'IMAGE_SAFETY':
+        return AiFinishReason.contentFilter;
       default:
         return AiFinishReason.unknown;
     }

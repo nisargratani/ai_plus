@@ -1,65 +1,44 @@
 # ai_plus
 
 [![pub package](https://img.shields.io/pub/v/ai_plus.svg)](https://pub.dev/packages/ai_plus)
+[![CI](https://github.com/nisargratani/ai_plus/actions/workflows/ci.yml/badge.svg)](https://github.com/nisargratani/ai_plus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Dart 3](https://img.shields.io/badge/Dart-3-blue.svg)](https://dart.dev)
 
-**A production-ready, provider-agnostic AI SDK for Dart & Flutter.**
+A provider-agnostic AI SDK for Dart and Flutter.
 
-> Write your AI logic once. Switch between OpenAI, Gemini, Anthropic, or any
-> OpenAI-compatible endpoint without changing a single line of business logic.
+Write your AI logic once against a single API, then switch between OpenAI,
+Google Gemini, Anthropic Claude, or any OpenAI-compatible server (Ollama,
+vLLM, Groq, OpenRouter, Azure OpenAI, ...) by changing one line.
 
----
-
-## Why ai_plus?
-
-| Feature | `ai_plus` | Raw HTTP | Other SDKs |
-|---------|:---------:|:--------:|:----------:|
-| Provider-agnostic | ✅ | ❌ | ❌ |
-| Tool calling | ✅ | Manual | Varies |
-| Structured output | ✅ | Manual | Varies |
-| Streaming | ✅ | Manual | ✅ |
-| Retry + Caching | ✅ Built-in | ❌ | ❌ |
-| RAG (Knowledge Base) | ✅ Built-in | ❌ | ❌ |
-| Autonomous Agents | ✅ Built-in | ❌ | ❌ |
-| Multimodal (images) | ✅ | Manual | Varies |
-| Pure Dart (no Flutter dep) | ✅ | ✅ | Varies |
-
----
-
-## Supported Providers
-
-| Provider | Chat | Streaming | Tool Calling | Structured Output | Embeddings | Image Input |
-|----------|:----:|:---------:|:------------:|:-----------------:|:----------:|:-----------:|
-| **OpenAI** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Google Gemini** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Anthropic (Claude)** | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| **Custom (OpenAI-compatible)** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-
-Custom providers cover Ollama, LocalAI, Azure OpenAI, Together AI, Groq, and any
-service exposing an OpenAI-compatible `/v1/chat/completions` endpoint.
+- Chat, streaming and multi-turn conversations
+- Tool calling, including streamed tool calls, and an automatic agent loop
+- Typed structured output (`generate<T>`)
+- Embeddings and a small RAG helper (`AiKnowledgeBase`)
+- Middleware: retries with backoff, response caching, logging, metrics
+- Typed exceptions with provider error messages, status codes and request IDs
+- Pure Dart, with only `http` and `crypto` as dependencies
 
 ---
 
 ## Installation
 
-```yaml
-dependencies:
-  ai_plus: ^0.0.1
+```bash
+dart pub add ai_plus
+# or
+flutter pub add ai_plus
 ```
 
-```bash
-dart pub get
-```
+**Requirements:** Dart 3.4+ (Flutter 3.22+). Runs on every Dart platform:
+Android, iOS, macOS, Windows, Linux, web and server.
 
 ---
 
-## Quick Start
+## Quick start
 
 ```dart
 import 'package:ai_plus/ai_plus.dart';
 
-void main() async {
+Future<void> main() async {
   final ai = AiClient(
     provider: AiProvider.openAI(apiKey: 'YOUR_API_KEY'),
   );
@@ -73,23 +52,62 @@ void main() async {
 
   print(response.text);
   print('Tokens used: ${response.usage.totalTokens}');
+
+  ai.close(); // Releases HTTP connections.
 }
 ```
 
 Switch providers by changing one line:
 
 ```dart
-// Google Gemini
-final ai = AiClient(provider: AiProvider.gemini(apiKey: apiKey));
+final ai = AiClient(provider: AiProvider.gemini(apiKey: geminiKey));
+final ai = AiClient(provider: AiProvider.anthropic(apiKey: anthropicKey));
 
-// Anthropic Claude
-final ai = AiClient(provider: AiProvider.anthropic(apiKey: apiKey));
-
-// Ollama / LocalAI / Any OpenAI-compatible
+// Local Ollama (no key needed)
 final ai = AiClient(
   provider: AiProvider.custom(baseUrl: 'http://localhost:11434/v1', apiKey: ''),
+  defaultModel: 'llama3.2',
+);
+
+// Azure OpenAI (key in an `api-key` header)
+final ai = AiClient(
+  provider: AiProvider.custom(
+    baseUrl: 'https://my-resource.openai.azure.com/openai/v1',
+    apiKey: '',
+    headers: {'api-key': azureKey},
+  ),
+  defaultModel: 'my-deployment',
 );
 ```
+
+---
+
+## Providers
+
+| Provider | Chat | Streaming | Tools | Structured output | Embeddings | Images | Audio |
+|----------|:----:|:---------:|:-----:|:-----------------:|:----------:|:------:|:-----:|
+| OpenAI | ✅ | ✅ | ✅ | ✅ native | ✅ | ✅ | ❌ |
+| Google Gemini | ✅ | ✅ | ✅ | ✅ native | ✅ | ✅ | ✅ |
+| Anthropic Claude | ✅ | ✅ | ✅ | ✅ via prompt | ❌ | ✅ | ❌ |
+| Custom (OpenAI-compatible) | ✅ | ✅ | ✅ | ✅ native* | ✅* | ✅* | ❌ |
+
+\* Depends on what the server implements. Check `provider.capabilities` at
+runtime.
+
+**Default models** are used when neither the request nor
+`AiClient.defaultModel` names one. Set a model explicitly in production so
+upgrades never change it:
+
+| Provider | Chat | Embeddings |
+|----------|------|------------|
+| OpenAI | `gpt-4o-mini` | `text-embedding-3-small` |
+| Gemini | `gemini-flash-latest` | `gemini-embedding-001` |
+| Anthropic | `claude-sonnet-5` (`max_tokens` 1024) | — |
+| Custom | `gpt-4o-mini` (always set a model) | `text-embedding-3-small` |
+
+Every factory accepts optional `headers` (sent with every request) and
+`httpClient`. The concrete classes (`OpenAiProvider`, `GeminiProvider`,
+`AnthropicProvider`, `CustomProvider`) are exported too.
 
 ---
 
@@ -102,30 +120,38 @@ await for (final chunk in ai.stream(messages: [AiMessage.user('Write a poem')]))
   stdout.write(chunk.text);
 }
 
-// Or use the convenience method:
+// Text only:
 await for (final text in ai.streamText(messages: [AiMessage.user('Hello')])) {
   stdout.write(text);
 }
 ```
 
-### Conversations (Multi-Turn)
+Stream semantics are the same for all providers:
+
+- `chunk.finishReason` is `null` on every chunk except the last one.
+- Tool calls arrive once, with complete arguments.
+- `chunk.usage` (when the provider reports it) holds cumulative totals.
+- Breaking out of `await for` cancels the HTTP request.
+
+### Conversations
 
 ```dart
 final conversation = ai.conversation();
 
-final reply1 = await conversation.send('My name is Alice.');
-print(reply1.text);
+await conversation.send('My name is Alice.');
+final reply = await conversation.send('What is my name?');
+print(reply.text); // "Your name is Alice."
 
-final reply2 = await conversation.send('What is my name?');
-print(reply2.text); // "Your name is Alice."
-
-// Stream within a conversation (history is auto-managed)
 await for (final chunk in conversation.stream('Tell me a joke.')) {
   stdout.write(chunk.text);
 }
 ```
 
-### Tool Calling
+A turn is added to `conversation.messages` only after it succeeds. If a
+request fails, or you cancel a stream, the history is left unchanged, so you
+can simply retry. Await each call before starting the next.
+
+### Tool calling
 
 ```dart
 final weatherTool = AiTool(
@@ -137,9 +163,7 @@ final weatherTool = AiTool(
     },
     required: ['location'],
   ),
-  execute: (args) async {
-    return 'Sunny, 72°F in ${args['location']}';
-  },
+  execute: (args) async => 'Sunny, 22°C in ${args['location']}',
 );
 
 final response = await ai.chat(
@@ -147,11 +171,15 @@ final response = await ai.chat(
   tools: [weatherTool],
 );
 
-// The response may contain tool calls:
 final toolCalls = response.message.content.whereType<AiToolCallContent>();
+final results = await ToolExecutor([weatherTool]).executeAll(toolCalls.toList());
 ```
 
-### Autonomous Agents
+A tool's return value is sent to the model as-is if it is a string, and
+JSON-encoded otherwise. `ToolExecutor` catches exceptions a tool throws and
+reports them to the model as error results.
+
+### Agents (automatic tool loop)
 
 ```dart
 final agent = AiAgent(
@@ -161,38 +189,43 @@ final agent = AiAgent(
   maxIterations: 5,
 );
 
-final answer = await agent.run('Should I bring an umbrella to San Francisco?');
-print(answer);
+final answer = await agent.run('Should I bring an umbrella to London?');
 ```
 
-### Structured Output
+The agent calls the model, runs any requested tools (in parallel), feeds the
+results back, and repeats until the model answers without calling a tool. If
+that doesn't happen within `maxIterations`, it throws `AiToolException`.
+
+### Structured output
 
 ```dart
-final schema = AiJsonSchema.object(
-  properties: {
-    'name': AiJsonSchema.string(),
-    'age': AiJsonSchema.integer(),
-    'hobbies': AiJsonSchema.array(items: AiJsonSchema.string()),
-  },
-  required: ['name', 'age'],
-);
-
 final profile = await ai.generate<Map<String, dynamic>>(
   prompt: 'Create a fictional user profile.',
-  schema: schema,
-  decoder: (json) => json,
+  schema: AiJsonSchema.object(
+    properties: {
+      'name': AiJsonSchema.string(),
+      'age': AiJsonSchema.integer(),
+      'hobbies': AiJsonSchema.array(items: AiJsonSchema.string()),
+    },
+    required: ['name', 'age', 'hobbies'],
+  ),
+  decoder: (json) => json, // or UserProfile.fromJson
 );
-
-print(profile['name']);
 ```
 
-### Multimodal (Image Input)
+- **OpenAI:** when every property of every object is listed in `required`,
+  OpenAI's strict mode is used, which guarantees the reply matches the schema.
+  Otherwise the schema is sent as a best-effort hint.
+- **Gemini:** the schema is sent as `responseSchema`.
+- **Anthropic:** the schema is added to the prompt as an instruction.
+
+If no valid JSON object can be extracted, or `decoder` throws,
+`generate` throws `AiStructuredOutputException`.
+
+### Images and audio
 
 ```dart
-import 'dart:io';
-import 'dart:typed_data';
-
-final imageBytes = File('photo.png').readAsBytesSync();
+final imageBytes = await File('photo.png').readAsBytes();
 
 final response = await ai.chat(
   messages: [
@@ -207,213 +240,219 @@ final response = await ai.chat(
 );
 ```
 
-### Embeddings & RAG
+`AiAudioContent` is supported by Gemini. Unsupported content types throw
+`AiUnsupportedCapabilityException`.
+
+### Embeddings and RAG
 
 ```dart
-// Create embeddings
 final result = await ai.embeddings.create(input: 'Hello world');
-print(result.vector); // [0.012, -0.034, ...]
+print(result.vector);
 
-// Knowledge Base (RAG)
-final kb = AiKnowledgeBase(
-  client: ai,
-  embeddingService: ai.embeddings,
-);
+final batch = await ai.embeddings.createBatch(inputs: ['a', 'b', 'c']);
 
+final kb = AiKnowledgeBase(client: ai);
 await kb.ingest(id: 'doc1', content: 'Dart was created by Google in 2011.');
 await kb.ingest(id: 'doc2', content: 'Flutter uses Dart for cross-platform apps.');
 
-// Search
-final results = await kb.search('Who created Dart?');
-print(results.first.document.content);
-
-// Ask (full RAG pipeline: embed → search → answer)
+final hits = await kb.search('Who created Dart?');
 final answer = await kb.ask('What is Dart used for?');
 print(answer.text);
 ```
 
-### Prompt Templates
+`AiKnowledgeBase` accepts any `AiVectorStore`. The built-in
+`MemoryVectorStore` does a linear cosine-similarity scan and is meant for up
+to a few thousand documents. Implement `AiVectorStore` to plug in a real
+vector database. Documents are keyed by id, so re-ingesting an id replaces it.
+
+### Middleware: retries, caching, logging, metrics
 
 ```dart
-const template = AiPromptTemplate(
-  'Summarize the following {{language}} code:\n\n{{code}}',
-);
+final metrics = MetricsMiddleware();
 
-final prompt = template.render({
-  'language': 'Dart',
-  'code': 'void main() => print("hello");',
-});
-```
-
-### Middleware (Retries, Caching, Logging, Metrics)
-
-```dart
 final ai = AiClient(
   provider: AiProvider.openAI(apiKey: apiKey),
-  // Automatic retries with exponential backoff
-  retryPolicy: const AiRetryPolicy(
-    maxAttempts: 3,
-    backoffFactor: 2.0,
-  ),
-  // In-memory response cache
-  cache: MemoryAiCache(ttl: const Duration(minutes: 30)),
-  // Console logger
-  logger: const ConsoleAiLogger(enableDebug: true),
-  // Custom middleware
-  middlewares: [MetricsMiddleware()],
+  timeout: const Duration(seconds: 60),
+  retryPolicy: const AiRetryPolicy(maxAttempts: 3), // AiRetryPolicy.none to disable
+  cache: MemoryAiCache(ttl: const Duration(minutes: 30), maxEntries: 500),
+  logger: const ConsoleAiLogger(),
+  middlewares: [metrics],
 );
 ```
 
-### Cost Tracking
+- **Retries:** rate limits (429), timeouts, network errors and 5xx responses
+  are retried with exponential backoff and jitter. The provider's
+  `retry-after` hint is honoured, capped at `maxDelay`. A stream is retried
+  only if it fails before its first chunk, so output is never duplicated.
+- **Timeout:** for `chat`, the timeout applies to each attempt. For `stream`,
+  it is an idle timeout between chunks.
+- **Cache:** keys are SHA-256 digests of the whole request (model,
+  parameters, tools, schema, all message content including images). Streams
+  are not cached. Implement `AiCache` for persistent storage.
+- **Logging:** only metadata and latency are logged, never message content
+  or API keys.
+
+Custom middleware extends `AiMiddleware` and overrides what it needs:
+
+```dart
+class AuditMiddleware extends AiMiddleware {
+  @override
+  Future<AiResponse> handleChat(AiRequest request, AiRequestHandler next) async {
+    final response = await next(request);
+    audit(request.model, response.usage);
+    return response;
+  }
+}
+```
+
+### Prompt templates
+
+```dart
+const template = AiPromptTemplate('Summarize this {{language}} code:\n\n{{code}}');
+
+final prompt = template.render({'language': 'Dart', 'code': source});
+```
+
+Substitution happens in a single pass. A `{{placeholder}}` inside an inserted
+value is left untouched, so user input cannot pull in other variables.
+
+### Cost tracking
 
 ```dart
 final tracker = AiCostTracker(
   pricing: const AiPricing(
-    inputCostPerToken: 0.0000025,  // $2.50 per 1M tokens
-    outputCostPerToken: 0.00001,   // $10 per 1M tokens
+    inputCostPerToken: 0.0000025, // $2.50 per 1M tokens
+    outputCostPerToken: 0.00001, // $10 per 1M tokens
   ),
 );
 
-final response = await ai.chat(messages: [...]);
 tracker.addUsage(response.usage);
-
 print('Total cost: \$${tracker.estimatedCost.toStringAsFixed(4)}');
 ```
 
-### Conversation Storage
+### Conversation storage
 
 ```dart
-// In-memory storage (provided)
-final storage = InMemoryConversationStorage();
+final storage = InMemoryConversationStorage(); // or your own AiConversationStorage
 
-// Save a conversation
-final conversation = ai.conversation(id: 'session-1');
-await conversation.send('Hello!');
 await storage.save(conversation.id, conversation.messages);
 
-// Restore later
-final messages = await storage.load('session-1');
-final restored = ai.conversation(
-  id: 'session-1',
-  initialMessages: messages ?? [],
-);
+final messages = await storage.load(conversation.id);
+final restored = ai.conversation(id: conversation.id, initialMessages: messages ?? []);
 ```
+
+When persisting tool calls, keep `AiToolCallContent.metadata`. Gemini
+requires its `thoughtSignature` to be sent back.
 
 ---
 
-## Error Handling
+## Error handling
 
-All exceptions extend `AiException` for consistent error handling:
+Every error thrown by the SDK extends `AiException`, which carries
+`message` (including the provider's own error text), `provider`,
+`statusCode` and `requestId` when available.
 
 ```dart
 try {
-  final response = await ai.chat(messages: [...]);
+  final response = await ai.chat(messages: [AiMessage.user('Hi')]);
 } on AiAuthenticationException {
   print('Invalid API key');
 } on AiRateLimitException catch (e) {
   print('Rate limited. Retry after: ${e.retryAfter}');
 } on AiTimeoutException {
   print('Request timed out');
-} on AiUnsupportedCapabilityException {
-  print('Provider does not support this feature');
 } on AiException catch (e) {
-  print('AI error: ${e.message}');
+  print('AI error: $e'); // Includes provider, status and request id.
 }
 ```
-
-**Exception hierarchy:**
 
 | Exception | When |
 |-----------|------|
 | `AiAuthenticationException` | Invalid API key (401) |
 | `AiAuthorizationException` | Insufficient permissions (403) |
-| `AiRateLimitException` | Rate limited (429) |
-| `AiNetworkException` | Connection failed |
-| `AiTimeoutException` | Request timed out |
-| `AiInvalidRequestException` | Bad request (400) |
-| `AiProviderException` | Server error (5xx) |
-| `AiParsingException` | Response parsing failed |
-| `AiContentFilterException` | Content safety filter |
-| `AiUnsupportedCapabilityException` | Feature not supported |
-| `AiStructuredOutputException` | JSON extraction/validation failed |
-| `AiToolNotFoundException` | Unknown tool called |
-| `AiToolException` | Tool execution failed |
+| `AiRateLimitException` | Rate limited (429); `retryAfter` from response headers |
+| `AiTimeoutException` | Client-side timeout, or HTTP 408 |
+| `AiNetworkException` | Connection failed or dropped |
+| `AiInvalidRequestException` | Other 4xx (bad parameters, unknown model, ...) |
+| `AiProviderException` | Server error (5xx) or error event inside a stream |
+| `AiParsingException` | Unexpected response format |
+| `AiContentFilterException` | Prompt blocked by the provider's safety system |
+| `AiUnsupportedCapabilityException` | Feature not supported by the provider |
+| `AiStructuredOutputException` | JSON extraction or decoding failed in `generate` |
+| `AiToolException` | Agent did not finish within `maxIterations` |
 
----
-
-## Architecture
-
-```
-┌─────────────────────────────┐
-│       Your Application      │
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│          AiClient           │  ← Middleware pipeline
-│   (chat, stream, generate)  │  ← Retry, Cache, Logging
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│         AiProvider          │  ← Abstract interface
-└──────┬───────┬───────┬──────┘
-       │       │       │
-   ┌───▼──┐ ┌─▼───┐ ┌─▼────────┐
-   │OpenAI│ │Gemini│ │Anthropic │
-   └──────┘ └─────┘ └──────────┘
-```
+All errors, validation errors included, are delivered through the returned
+`Future` or `Stream`.
 
 ---
 
 ## Security
 
-> ⚠️ **Never hardcode API keys** in your source code.
+- **Never hardcode API keys.** Load them from the environment or secure
+  storage:
 
-Use environment variables or secure storage:
+  ```dart
+  final apiKey = Platform.environment['OPENAI_API_KEY']!;
+  ```
 
-```dart
-import 'dart:io';
-
-final apiKey = Platform.environment['OPENAI_API_KEY']!;
-final ai = AiClient(provider: AiProvider.openAI(apiKey: apiKey));
-```
-
-- API keys are never logged by the SDK, even in debug mode.
-- Raw responses (available via `response.raw`) may contain sensitive data; handle accordingly.
-- The `ConsoleAiLogger` only logs request/response metadata, never full payloads.
+- **Client apps (Flutter, web):** a key shipped inside an app can be
+  extracted, and on the web it is visible in the browser. For production
+  apps, route requests through your own backend, and point `baseUrl` at it.
+- API keys are sent only in request headers (Gemini uses `x-goog-api-key`).
+  They are never put in URLs, never logged, and never included in exception
+  messages.
+- `response.raw` and `AiParsingException.rawResponse` contain provider
+  payloads. Treat them as sensitive.
 
 ---
 
-## Testing
+## Testing your code
 
-The SDK is designed to be testable. All providers accept an injectable HTTP client:
+Inject a mock HTTP client from `package:http/testing.dart`:
 
 ```dart
+import 'package:ai_plus/ai_plus.dart';
+import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:ai_plus/src/http/ai_http_client.dart';
-
-final mockClient = MockClient((request) async {
-  return http.Response(jsonEncode({...}), 200);
-});
 
 final provider = OpenAiProvider(
   apiKey: 'test-key',
-  httpClient: AiHttpClient(client: mockClient),
+  httpClient: AiHttpClient(
+    client: MockClient((request) async => http.Response(jsonEncode({...}), 200)),
+  ),
 );
 ```
+
+Alternatively, implement `AiProvider` with a small fake for fully offline
+tests.
+
+---
+
+## Limitations
+
+- Only the first candidate or choice of a response is returned.
+- `MemoryVectorStore` and `MemoryAiCache` keep data in process memory.
+- Streaming responses are not cached, and streams are not resumed after a
+  mid-stream failure.
+- Provider-specific features beyond the common surface (for example
+  reasoning-effort settings or prompt caching) are not exposed as typed
+  options.
+
+## Migrating from 0.0.1
+
+0.0.2 keeps the 0.0.1 API. The behaviour changes worth knowing about are
+listed in the [changelog](CHANGELOG.md). In short: failed conversation turns
+no longer stay in the history, Gemini and Anthropic default models were
+updated, and `AiKnowledgeBase.ask(systemPrompt:)` now keeps the retrieved
+context.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-Please ensure all tests pass and the code is formatted before submitting:
+Issues and pull requests are welcome at
+[github.com/nisargratani/ai_plus](https://github.com/nisargratani/ai_plus).
+Before submitting, please run:
 
 ```bash
 dart format .
@@ -421,8 +460,6 @@ dart analyze
 dart test
 ```
 
----
-
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

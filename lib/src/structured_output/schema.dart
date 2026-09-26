@@ -1,12 +1,41 @@
-/// A simple abstraction over JSON Schema.
+/// A simple abstraction over the subset of JSON Schema that all supported
+/// providers understand.
+///
+/// Used for tool parameters and structured output:
+///
+/// ```dart
+/// final schema = AiJsonSchema.object(
+///   properties: {
+///     'name': AiJsonSchema.string(),
+///     'tags': AiJsonSchema.array(items: AiJsonSchema.string()),
+///   },
+///   required: ['name', 'tags'],
+/// );
+/// ```
+///
+/// For OpenAI structured output, listing every property in [required]
+/// enables strict mode, which guarantees the reply matches the schema.
 class AiJsonSchema {
+  /// The JSON type: `object`, `array`, `string`, `integer`, `number` or
+  /// `boolean`.
   final String type;
+
+  /// A description that helps the model fill in the value.
   final String? description;
+
+  /// The properties of an `object` schema.
   final Map<String, AiJsonSchema>? properties;
+
+  /// The names of required properties of an `object` schema.
   final List<String>? required;
+
+  /// The schema of the elements of an `array` schema.
   final AiJsonSchema? items;
+
+  /// The allowed values (JSON Schema `enum`).
   final List<dynamic>? enumValues;
 
+  /// Creates a schema node. Prefer the named factories.
   const AiJsonSchema({
     required this.type,
     this.description,

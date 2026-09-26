@@ -1,5 +1,5 @@
-import 'ai_tool.dart';
 import '../models/ai_content.dart';
+import 'ai_tool.dart';
 
 /// Helper class to safely execute tools requested by the AI model.
 ///
@@ -19,7 +19,9 @@ class ToolExecutor {
   /// Executes a tool call requested by the AI model.
   ///
   /// Returns an [AiToolResultContent] containing the execution result or error.
-  /// If the tool is not found, returns a result with [isError] set to true.
+  /// If the tool is not found or throws, returns a result with
+  /// [AiToolResultContent.isError] set to `true` and a description of the
+  /// problem, which can be sent back to the model.
   Future<AiToolResultContent> execute(AiToolCallContent call) async {
     final tool = _tools[call.name];
 
@@ -49,7 +51,8 @@ class ToolExecutor {
     }
   }
 
-  /// Executes multiple tool calls concurrently.
+  /// Executes multiple tool calls concurrently, returning results in the
+  /// same order as [calls].
   Future<List<AiToolResultContent>> executeAll(
       List<AiToolCallContent> calls) async {
     return Future.wait(calls.map(execute));

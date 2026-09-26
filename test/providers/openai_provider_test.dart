@@ -1,10 +1,9 @@
 import 'dart:convert';
-import 'package:test/test.dart';
+
+import 'package:ai_plus/ai_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:ai_plus/ai_plus.dart';
-import 'package:ai_plus/src/http/ai_http_client.dart';
-import 'package:ai_plus/src/providers/openai/openai_provider.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('OpenAiProvider', () {

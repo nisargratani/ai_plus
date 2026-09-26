@@ -67,45 +67,49 @@ abstract interface class AiVectorStore {
   Future<void> clear();
 }
 
-/// A simple, in-memory vector store for testing and simple RAG applications.
+/// A simple, in-memory vector store for testing and small RAG applications.
 ///
-/// Uses cosine similarity for similarity search.
+/// Uses cosine similarity. Search is a linear scan, O(n·d) for n documents
+/// of dimension d, which is fast for a few thousand documents; use a
+/// dedicated vector database for larger corpora.
+///
+/// Documents are keyed by [AiDocument.id]: adding a document with an
+/// existing id replaces it.
 ///
 /// ```dart
 /// final store = MemoryVectorStore();
-/// store.add(AiDocument(id: '1', content: '...', embedding: embedding));
+/// await store.add(AiDocument(id: '1', content: '...', embedding: embedding));
 /// final results = await store.search(queryEmbedding, k: 3);
 /// ```
 class MemoryVectorStore implements AiVectorStore {
-  final List<AiDocument> _documents = [];
+  /// Creates an empty store.
+  MemoryVectorStore();
+
+  final Map<String, _StoredDocument> _documents = {};
+
+  /// The number of documents in the store.
+  int get length => _documents.length;
 
   @override
   Future<void> add(AiDocument document) async {
-    _documents.add(document);
+    _documents[document.id] = _StoredDocument(document);
   }
 
   @override
   Future<void> addAll(List<AiDocument> documents) async {
-    _documents.addAll(documents);
+    for (final document in documents) {
+      _documents[document.id] = _StoredDocument(document);
+    }
   }
 
   @override
   Future<List<AiSearchResult>> search(AiEmbedding query, {int k = 4}) async {
-    if (_documents.isEmpty) return [];
-
-    final results = _documents.map((doc) {
-      final score = _cosineSimilarity(query.vector, doc.embedding.vector);
-      return AiSearchResult(document: doc, score: score);
-    }).toList();
-
-    results.sort((a, b) => b.score.compareTo(a.score));
-
-    return results.take(k).toList();
+    return similaritySearch(query, k: k);
   }
 
   @override
   Future<void> delete(String id) async {
-    _documents.removeWhere((doc) => doc.id == id);
+    _documents.remove(id);
   }
 
   @override
@@ -114,36 +118,64 @@ class MemoryVectorStore implements AiVectorStore {
   }
 
   /// Performs synchronous similarity search (convenience for in-memory use).
+  ///
+  /// Returns up to [k] results sorted by descending cosine similarity.
+  /// Throws [ArgumentError] if a stored vector's dimension differs from
+  /// [query]'s.
   List<AiSearchResult> similaritySearch(AiEmbedding query, {int k = 4}) {
-    if (_documents.isEmpty) return [];
+    if (_documents.isEmpty || k <= 0) return [];
 
-    final results = _documents.map((doc) {
-      final score = _cosineSimilarity(query.vector, doc.embedding.vector);
-      return AiSearchResult(document: doc, score: score);
-    }).toList();
+    final queryNorm = _norm(query.vector);
+    final results = [
+      for (final stored in _documents.values)
+        AiSearchResult(
+          document: stored.document,
+          score: _cosineSimilarity(
+            query.vector,
+            queryNorm,
+            stored.document.embedding.vector,
+            stored.norm,
+          ),
+        ),
+    ]..sort((a, b) => b.score.compareTo(a.score));
 
-    results.sort((a, b) => b.score.compareTo(a.score));
-
-    return results.take(k).toList();
+    return results.length > k ? results.sublist(0, k) : results;
   }
 
-  double _cosineSimilarity(List<double> a, List<double> b) {
+  static double _norm(List<double> v) {
+    var sum = 0.0;
+    for (final x in v) {
+      sum += x * x;
+    }
+    return math.sqrt(sum);
+  }
+
+  static double _cosineSimilarity(
+    List<double> a,
+    double normA,
+    List<double> b,
+    double normB,
+  ) {
     if (a.length != b.length) {
-      throw ArgumentError('Vectors must have the same length.');
+      throw ArgumentError(
+        'Vectors must have the same length (${a.length} != ${b.length}).',
+      );
     }
-
-    double dotProduct = 0.0;
-    double normA = 0.0;
-    double normB = 0.0;
-
-    for (int i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-
     if (normA == 0.0 || normB == 0.0) return 0.0;
 
-    return dotProduct / (math.sqrt(normA) * math.sqrt(normB));
+    var dotProduct = 0.0;
+    for (var i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+    }
+    return dotProduct / (normA * normB);
   }
+}
+
+/// A document together with its precomputed vector norm.
+class _StoredDocument {
+  _StoredDocument(this.document)
+      : norm = MemoryVectorStore._norm(document.embedding.vector);
+
+  final AiDocument document;
+  final double norm;
 }

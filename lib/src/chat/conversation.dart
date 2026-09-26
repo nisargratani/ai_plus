@@ -1,8 +1,9 @@
+import '../agent/ai_agent.dart';
 import '../core/ai_client.dart';
 import '../core/ai_response.dart';
 import '../core/ai_stream.dart';
-import '../models/ai_message.dart';
 import '../models/ai_content.dart';
+import '../models/ai_message.dart';
 import '../tools/ai_tool.dart';
 
 /// Represents an ongoing conversation with an AI model.
@@ -21,6 +22,8 @@ class AiConversation {
   final AiClient _client;
   final List<AiMessage> _messages = [];
 
+  static int _idCounter = 0;
+
   /// A unique identifier for this conversation.
   final String id;
 
@@ -28,6 +31,9 @@ class AiConversation {
   final String? model;
 
   /// The tools available in this conversation.
+  ///
+  /// Tool calls are returned to you but not executed automatically; use
+  /// [AiAgent] for an automatic tool loop.
   final List<AiTool>? tools;
 
   /// The maximum number of tokens per response.
@@ -42,7 +48,8 @@ class AiConversation {
   /// Creates a new conversation.
   ///
   /// Typically you would use [AiClient.conversation] instead of
-  /// constructing this directly.
+  /// constructing this directly. When [id] is omitted a process-unique id is
+  /// generated.
   AiConversation(
     this._client, {
     String? id,
@@ -51,34 +58,40 @@ class AiConversation {
     this.maxTokens,
     this.temperature,
     List<AiMessage> initialMessages = const [],
-  }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString() {
+  }) : id = id ?? '${DateTime.now().microsecondsSinceEpoch}-${_idCounter++}' {
     _messages.addAll(initialMessages);
   }
 
   /// Sends a text message to the AI and returns the response.
   ///
-  /// The user message and the assistant's response are both automatically
-  /// added to the conversation history.
+  /// The user message and the assistant's response are added to the history
+  /// together once the request succeeds. If the request fails the history is
+  /// left unchanged, so the call can simply be retried.
+  ///
+  /// Calls should not overlap: await each [send] before the next one.
   Future<AiResponse> send(String text) async {
-    _messages.add(AiMessage.user(text));
+    final userMessage = AiMessage.user(text);
 
     final response = await _client.chat(
-      messages: _messages,
+      messages: [..._messages, userMessage],
       model: model,
       tools: tools,
       maxTokens: maxTokens,
       temperature: temperature,
     );
 
-    _messages.add(response.message);
+    _messages
+      ..add(userMessage)
+      ..add(response.message);
     return response;
   }
 
   /// Sends a text message to the AI and streams the response.
   ///
-  /// The user message is added to history immediately. The full assistant
-  /// response is assembled from stream chunks and added to history when
-  /// the stream completes.
+  /// When the stream completes successfully, the user message and the full
+  /// assistant response (assembled from the chunks) are added to the
+  /// history. If the stream fails or is cancelled, the history is left
+  /// unchanged.
   ///
   /// ```dart
   /// await for (final chunk in conversation.stream('Tell me a joke')) {
@@ -87,33 +100,37 @@ class AiConversation {
   /// // After the stream completes, the full response is in conversation.messages
   /// ```
   Stream<AiStreamChunk> stream(String text) async* {
-    _messages.add(AiMessage.user(text));
-
-    final chunks = <AiStreamChunk>[];
+    final userMessage = AiMessage.user(text);
+    final textBuffer = StringBuffer();
+    final otherContent = <AiContent>[];
 
     await for (final chunk in _client.stream(
-      messages: _messages,
+      messages: [..._messages, userMessage],
       model: model,
       tools: tools,
       maxTokens: maxTokens,
       temperature: temperature,
     )) {
-      chunks.add(chunk);
+      for (final part in chunk.content) {
+        if (part is AiTextContent) {
+          textBuffer.write(part.text);
+        } else {
+          otherContent.add(part);
+        }
+      }
       yield chunk;
     }
 
-    // Assemble the full assistant message from all chunks
-    final allContent = <AiContent>[];
-    for (final chunk in chunks) {
-      allContent.addAll(chunk.content);
-    }
-
-    if (allContent.isNotEmpty) {
-      _messages.add(AiMessage(
+    _messages
+      ..add(userMessage)
+      ..add(AiMessage(
         role: AiMessageRole.assistant,
-        content: allContent,
+        content: [
+          if (textBuffer.isNotEmpty || otherContent.isEmpty)
+            AiTextContent(textBuffer.toString()),
+          ...otherContent,
+        ],
       ));
-    }
   }
 
   /// Adds a raw message to the history without triggering a request.

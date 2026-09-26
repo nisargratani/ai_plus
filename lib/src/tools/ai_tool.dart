@@ -1,4 +1,5 @@
 import '../structured_output/schema.dart';
+import 'tool_executor.dart';
 
 /// Represents a tool (function) that the AI model can call.
 class AiTool {
@@ -12,8 +13,13 @@ class AiTool {
   final AiJsonSchema parameters;
 
   /// The callback to execute when the AI model requests this tool.
+  ///
+  /// The returned value is sent back to the model: strings verbatim, other
+  /// values JSON-encoded. Exceptions are caught by [ToolExecutor] and
+  /// reported to the model as error results.
   final Future<dynamic> Function(Map<String, dynamic> arguments) execute;
 
+  /// Creates a tool definition.
   const AiTool({
     required this.name,
     required this.description,
@@ -21,7 +27,7 @@ class AiTool {
     required this.execute,
   });
 
-  /// Converts the tool definition to a JSON map representing the schema.
+  /// Converts the tool definition to the OpenAI function-tool JSON format.
   Map<String, dynamic> toJson() {
     return {
       'type': 'function',

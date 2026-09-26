@@ -27,6 +27,7 @@ abstract class AiException implements Exception {
   /// A unique identifier for the request that caused the error (if available).
   final String? requestId;
 
+  /// Creates an exception with a human-readable [message].
   const AiException(
     this.message, {
     this.provider,
@@ -48,6 +49,7 @@ abstract class AiException implements Exception {
 ///
 /// Typically corresponds to HTTP 401.
 class AiAuthenticationException extends AiException {
+  /// Creates an [AiAuthenticationException].
   const AiAuthenticationException(
     super.message, {
     super.provider,
@@ -60,6 +62,7 @@ class AiAuthenticationException extends AiException {
 ///
 /// Typically corresponds to HTTP 403.
 class AiAuthorizationException extends AiException {
+  /// Creates an [AiAuthorizationException].
   const AiAuthorizationException(
     super.message, {
     super.provider,
@@ -70,11 +73,13 @@ class AiAuthorizationException extends AiException {
 
 /// Thrown when the provider rate limits the request.
 ///
-/// Check [retryAfter] for a provider-suggested wait duration.
+/// Check [retryAfter] for a provider-suggested wait duration (parsed from the
+/// `retry-after` / `retry-after-ms` response headers when present).
 class AiRateLimitException extends AiException {
   /// The duration to wait before retrying, if provided by the provider.
   final Duration? retryAfter;
 
+  /// Creates an [AiRateLimitException].
   const AiRateLimitException(
     super.message, {
     super.provider,
@@ -88,17 +93,26 @@ class AiRateLimitException extends AiException {
 ///
 /// This includes connection errors, DNS resolution failures, etc.
 class AiNetworkException extends AiException {
+  /// Creates an [AiNetworkException].
   const AiNetworkException(
     super.message, {
     super.provider,
+    super.statusCode,
+    super.requestId,
   });
 }
 
 /// Thrown when a request to the provider times out.
+///
+/// Raised either by the client-side `AiClient.timeout` or when the provider
+/// responds with HTTP 408.
 class AiTimeoutException extends AiException {
+  /// Creates an [AiTimeoutException].
   const AiTimeoutException(
     super.message, {
     super.provider,
+    super.statusCode,
+    super.requestId,
   });
 }
 
@@ -106,6 +120,7 @@ class AiTimeoutException extends AiException {
 ///
 /// Typically corresponds to HTTP 400.
 class AiInvalidRequestException extends AiException {
+  /// Creates an [AiInvalidRequestException].
   const AiInvalidRequestException(
     super.message, {
     super.provider,
@@ -118,6 +133,7 @@ class AiInvalidRequestException extends AiException {
 ///
 /// Typically corresponds to HTTP 5xx errors.
 class AiProviderException extends AiException {
+  /// Creates an [AiProviderException].
   const AiProviderException(
     super.message, {
     super.provider,
@@ -131,6 +147,7 @@ class AiParsingException extends AiException {
   /// The raw string that failed to parse.
   final String? rawResponse;
 
+  /// Creates an [AiParsingException].
   const AiParsingException(
     super.message, {
     super.provider,
@@ -139,7 +156,10 @@ class AiParsingException extends AiException {
 }
 
 /// Thrown when the content is filtered by the provider's safety systems.
+///
+/// For example, when Gemini blocks a prompt and returns no candidates.
 class AiContentFilterException extends AiException {
+  /// Creates an [AiContentFilterException].
   const AiContentFilterException(
     super.message, {
     super.provider,
@@ -150,6 +170,7 @@ class AiContentFilterException extends AiException {
 
 /// Thrown when attempting to use a capability that the current provider does not support.
 class AiUnsupportedCapabilityException extends AiException {
+  /// Creates an [AiUnsupportedCapabilityException].
   const AiUnsupportedCapabilityException(
     super.message, {
     super.provider,
@@ -164,6 +185,7 @@ class AiStructuredOutputException extends AiException {
   /// The raw response text that failed to parse or validate.
   final String? rawResponse;
 
+  /// Creates an [AiStructuredOutputException].
   const AiStructuredOutputException(
     super.message, {
     super.provider,
@@ -173,6 +195,7 @@ class AiStructuredOutputException extends AiException {
 
 /// Thrown when the AI model attempts to call a tool that is not registered.
 class AiToolNotFoundException extends AiException {
+  /// Creates an [AiToolNotFoundException].
   const AiToolNotFoundException(
     super.message, {
     super.provider,
@@ -181,6 +204,7 @@ class AiToolNotFoundException extends AiException {
 
 /// Thrown when the execution of a tool fails.
 class AiToolException extends AiException {
+  /// Creates an [AiToolException].
   const AiToolException(
     super.message, {
     super.provider,

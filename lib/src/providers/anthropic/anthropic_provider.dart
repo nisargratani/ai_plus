@@ -1,26 +1,59 @@
 import 'dart:convert';
+
+import '../../core/ai_capabilities.dart';
 import '../../core/ai_provider.dart';
 import '../../core/ai_request.dart';
 import '../../core/ai_response.dart';
 import '../../core/ai_stream.dart';
-import '../../core/ai_capabilities.dart';
-import '../../models/ai_message.dart';
-import '../../models/ai_content.dart';
-import '../../models/ai_usage.dart';
-import '../../models/ai_finish_reason.dart';
 import '../../embeddings/embedding.dart';
-import '../../http/ai_http_client.dart';
 import '../../errors/ai_exception.dart';
+import '../../http/ai_http_client.dart';
+import '../../models/ai_content.dart';
+import '../../models/ai_finish_reason.dart';
+import '../../models/ai_message.dart';
+import '../../models/ai_usage.dart';
+import '../../utils/json_utils.dart';
+import '../closeable_provider.dart';
 
 /// An AI provider implementation for Anthropic (Claude).
 ///
-/// Supports chat, streaming, tool calling, and multimodal (image) input.
-/// Anthropic does not provide a native embeddings endpoint.
+/// Supports chat, streaming (including streamed tool calls), tool calling
+/// and image input. Anthropic does not provide an embeddings endpoint, and
+/// structured output is handled by `AiClient.generate` via prompting.
 ///
 /// ```dart
 /// final provider = AiProvider.anthropic(apiKey: 'sk-ant-...');
 /// ```
-class AnthropicProvider implements AiProvider {
+///
+/// Defaults to the `claude-sonnet-5` model and `max_tokens: 1024` (the
+/// Messages API requires an explicit output limit).
+class AnthropicProvider implements AiProvider, CloseableProvider {
+  /// Creates an Anthropic provider.
+  ///
+  /// [headers] are sent with every request (for example `anthropic-beta`).
+  /// A [httpClient] passed in is not closed by [close]; the caller owns it.
+  AnthropicProvider({
+    required this.apiKey,
+    this.baseUrl = 'https://api.anthropic.com/v1',
+    this.apiVersion = '2023-06-01',
+    Map<String, String> headers = const {},
+    AiHttpClient? httpClient,
+  })  : _headers = {
+          'x-api-key': apiKey,
+          'anthropic-version': apiVersion,
+          ...headers,
+        },
+        _ownsHttpClient = httpClient == null,
+        _httpClient = httpClient ?? AiHttpClient();
+
+  /// The model used when a request does not specify one.
+  static const defaultModel = 'claude-sonnet-5';
+
+  /// The `max_tokens` used when a request does not specify one.
+  static const defaultMaxTokens = 1024;
+
+  static const _provider = 'Anthropic';
+
   /// The API key for authentication.
   final String apiKey;
 
@@ -30,212 +63,176 @@ class AnthropicProvider implements AiProvider {
   /// The Anthropic API version header.
   final String apiVersion;
 
+  final Map<String, String> _headers;
   final AiHttpClient _httpClient;
-
-  /// Creates an Anthropic provider.
-  ///
-  /// An optional [httpClient] can be provided for testing.
-  AnthropicProvider({
-    required this.apiKey,
-    this.baseUrl = 'https://api.anthropic.com/v1',
-    this.apiVersion = '2023-06-01',
-    AiHttpClient? httpClient,
-  }) : _httpClient = httpClient ?? AiHttpClient();
+  final bool _ownsHttpClient;
 
   @override
   AiCapabilities get capabilities => const AiCapabilities(
         streaming: true,
         toolCalling: true,
-        structuredOutput: false,
-        embeddings: false,
         imageInput: true,
-        audioInput: false,
-        fileInput: false,
       );
+
+  Uri get _messagesUri {
+    final base = baseUrl.endsWith('/')
+        ? baseUrl.substring(0, baseUrl.length - 1)
+        : baseUrl;
+    return Uri.parse('$base/messages');
+  }
 
   @override
   Future<AiResponse> chat(AiRequest request) async {
-    final body = _buildRequestBody(request);
-
     final result = await _httpClient.post(
-      Uri.parse('$baseUrl/messages'),
-      headers: _buildHeaders(),
-      body: body,
+      _messagesUri,
+      headers: _headers,
+      body: _buildRequestBody(request),
+      provider: _provider,
     );
-
     return _parseResponse(result);
   }
 
   @override
   Stream<AiStreamChunk> stream(AiRequest request) async* {
     final body = _buildRequestBody(request)..['stream'] = true;
+    final state = _StreamState();
 
-    final rawStream = _httpClient.postStream(
-      Uri.parse('$baseUrl/messages'),
-      headers: _buildHeaders(),
+    await for (final data in _httpClient.postSse(
+      _messagesUri,
+      headers: _headers,
       body: body,
-    );
-
-    String buffer = '';
-
-    await for (final chunk in rawStream) {
-      buffer += chunk;
-      final lines = buffer.split('\n');
-      buffer = lines.removeLast();
-
-      for (final line in lines) {
-        final trimmed = line.trim();
-        if (trimmed.isEmpty) continue;
-        if (!trimmed.startsWith('data: ')) continue;
-
-        final data = trimmed.substring(6).trim();
-        if (data.isEmpty) continue;
-
-        try {
-          final json = jsonDecode(data) as Map<String, dynamic>;
-          final type = json['type'] as String?;
-
-          if (type == 'content_block_start' ||
-              type == 'content_block_delta' ||
-              type == 'message_delta') {
-            yield _parseStreamChunk(json);
-          }
-        } catch (e) {
-          if (e is AiException) rethrow;
-          throw AiParsingException('Failed to parse Anthropic stream chunk: $e',
-              provider: 'Anthropic', rawResponse: data);
-        }
+      provider: _provider,
+    )) {
+      final Map<String, dynamic> json;
+      try {
+        json = jsonDecode(data) as Map<String, dynamic>;
+      } catch (e) {
+        throw AiParsingException(
+          'Failed to parse Anthropic stream chunk: $e',
+          provider: _provider,
+          rawResponse: data,
+        );
       }
+
+      final chunk = _parseStreamEvent(json, state);
+      if (chunk != null) yield chunk;
+      if (json['type'] == 'message_stop') break;
     }
   }
 
   @override
-  Future<AiEmbeddingResult> embeddings(List<String> inputs,
-      {String? model}) async {
+  Future<AiEmbeddingResult> embeddings(
+    List<String> inputs, {
+    String? model,
+  }) async {
     throw const AiUnsupportedCapabilityException(
       'Anthropic does not currently provide a native embeddings API endpoint.',
-      provider: 'Anthropic',
+      provider: _provider,
     );
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────
-
-  Map<String, String> _buildHeaders() {
-    return {
-      'x-api-key': apiKey,
-      'anthropic-version': apiVersion,
-    };
+  /// Closes the HTTP client created by this provider.
+  ///
+  /// Called automatically by `AiClient.close`.
+  @override
+  void close() {
+    if (_ownsHttpClient) _httpClient.close();
   }
 
+  // ── Request building ────────────────────────────────────────────────
+
   Map<String, dynamic> _buildRequestBody(AiRequest request) {
-    // Extract system instructions
-    final systemMessages = request.messages
+    final system = request.messages
         .where((m) =>
             m.role == AiMessageRole.system || m.role == AiMessageRole.developer)
         .map((m) => m.text)
         .join('\n');
 
-    // Build conversation messages (must alternate user/assistant)
-    final messages = <Map<String, dynamic>>[];
-    for (final m in request.messages) {
-      if (m.role == AiMessageRole.system || m.role == AiMessageRole.developer) {
-        continue; // Handled as top-level system
-      }
-      messages.add(_mapMessage(m));
-    }
-
     final body = <String, dynamic>{
-      'model': request.model ?? 'claude-sonnet-4-20250514',
-      'max_tokens': request.maxTokens ?? 1024,
-      'messages': messages,
-      if (systemMessages.isNotEmpty) 'system': systemMessages,
+      'model': request.model ?? defaultModel,
+      'max_tokens': request.maxTokens ?? defaultMaxTokens,
+      'messages': [
+        for (final m in request.messages)
+          if (m.role != AiMessageRole.system &&
+              m.role != AiMessageRole.developer)
+            _mapMessage(m),
+      ],
+      if (system.isNotEmpty) 'system': system,
       if (request.temperature != null) 'temperature': request.temperature,
       if (request.topP != null) 'top_p': request.topP,
       if (request.stop != null) 'stop_sequences': request.stop,
     };
 
-    // Tool definitions
-    if (request.tools != null && request.tools!.isNotEmpty) {
-      body['tools'] = request.tools!
-          .map((t) => {
-                'name': t.name,
-                'description': t.description,
-                'input_schema': t.parameters.toJson(),
-              })
-          .toList();
+    final tools = request.tools;
+    if (tools != null && tools.isNotEmpty) {
+      body['tools'] = [
+        for (final t in tools)
+          {
+            'name': t.name,
+            'description': t.description,
+            'input_schema': t.parameters.toJson(),
+          },
+      ];
     }
 
     return body;
   }
 
   Map<String, dynamic> _mapMessage(AiMessage message) {
-    final role = _mapRole(message.role);
-
-    // Handle tool result messages
     final toolResults =
         message.content.whereType<AiToolResultContent>().toList();
     if (toolResults.isNotEmpty) {
       return {
         'role': 'user',
-        'content': toolResults
-            .map((r) => {
-                  'type': 'tool_result',
-                  'tool_use_id': r.id,
-                  'content': r.result is String
-                      ? r.result as String
-                      : jsonEncode(r.result),
-                  if (r.isError) 'is_error': true,
-                })
-            .toList(),
+        'content': [
+          for (final r in toolResults)
+            {
+              'type': 'tool_result',
+              'tool_use_id': r.id,
+              'content': encodeToolResult(r.result),
+              if (r.isError) 'is_error': true,
+            },
+        ],
       };
     }
 
-    // Handle assistant messages with tool calls
+    final role = message.role == AiMessageRole.assistant ? 'assistant' : 'user';
+
     final toolCalls = message.content.whereType<AiToolCallContent>().toList();
     if (toolCalls.isNotEmpty) {
-      final contentBlocks = <Map<String, dynamic>>[];
-
-      // Add text if present
       final text = message.text;
-      if (text.isNotEmpty) {
-        contentBlocks.add({'type': 'text', 'text': text});
-      }
-
-      // Add tool use blocks
-      for (final tc in toolCalls) {
-        contentBlocks.add({
-          'type': 'tool_use',
-          'id': tc.id,
-          'name': tc.name,
-          'input': tc.arguments,
-        });
-      }
-
       return {
         'role': role,
-        'content': contentBlocks,
+        'content': [
+          if (text.isNotEmpty) {'type': 'text', 'text': text},
+          for (final tc in toolCalls)
+            {
+              'type': 'tool_use',
+              'id': tc.id,
+              'name': tc.name,
+              'input': tc.arguments,
+            },
+        ],
       };
     }
 
-    // Handle multimodal content
-    final hasMultimodal = message.content.any((c) =>
-        c is AiImageContent || c is AiAudioContent || c is AiFileContent);
-
+    final hasMultimodal = message.content.any(
+      (c) => c is AiImageContent || c is AiAudioContent || c is AiFileContent,
+    );
     if (hasMultimodal) {
       return {
         'role': role,
-        'content': message.content.map(_mapContent).toList(),
+        'content': [
+          for (final c in message.content)
+            if (_mapContent(c) case final block?) block,
+        ],
       };
     }
 
-    // Simple text message
-    return {
-      'role': role,
-      'content': message.text,
-    };
+    return {'role': role, 'content': message.text};
   }
 
-  Map<String, dynamic> _mapContent(AiContent content) {
+  Map<String, dynamic>? _mapContent(AiContent content) {
     switch (content) {
       case AiTextContent(:final text):
         return {'type': 'text', 'text': text};
@@ -251,161 +248,183 @@ class AnthropicProvider implements AiProvider {
       case AiAudioContent():
         throw const AiUnsupportedCapabilityException(
           'Audio content is not supported by Anthropic',
-          provider: 'Anthropic',
+          provider: _provider,
         );
       case AiFileContent():
         throw const AiUnsupportedCapabilityException(
           'File content is not supported by Anthropic',
-          provider: 'Anthropic',
+          provider: _provider,
         );
       case AiToolCallContent():
-        return {'type': 'text', 'text': ''};
       case AiToolResultContent():
-        return {'type': 'text', 'text': ''};
+        return null; // Handled at the message level.
     }
   }
 
-  String _mapRole(AiMessageRole role) {
-    switch (role) {
-      case AiMessageRole.user:
-        return 'user';
-      case AiMessageRole.assistant:
-        return 'assistant';
-      case AiMessageRole.tool:
-        return 'user'; // Tool results come as user messages in Anthropic
-      case AiMessageRole.system:
-      case AiMessageRole.developer:
-        return 'user'; // Handled separately
-    }
-  }
+  // ── Response parsing ────────────────────────────────────────────────
 
   AiResponse _parseResponse(Map<String, dynamic> json) {
     try {
-      final content = json['content'] as List?;
-      if (content == null || content.isEmpty) {
-        throw const AiParsingException('No content returned by Anthropic',
-            provider: 'Anthropic');
+      // An empty `content` array is valid (e.g. an immediate stop sequence).
+      final blocks = (json['content'] as List?) ?? const [];
+      final content = <AiContent>[];
+
+      for (final block in blocks.cast<Map<String, dynamic>>()) {
+        switch (block['type']) {
+          case 'text':
+            final text = block['text'] as String? ?? '';
+            if (text.isNotEmpty) content.add(AiTextContent(text));
+          case 'tool_use':
+            content.add(AiToolCallContent(
+              id: block['id'] as String,
+              name: block['name'] as String,
+              arguments: (block['input'] as Map<String, dynamic>?) ?? {},
+            ));
+        }
       }
 
-      final message = _parseAssistantContent(content);
-
       final usageJson = json['usage'] as Map<String, dynamic>?;
-      final usage = usageJson != null
-          ? AiUsage(
-              inputTokens: usageJson['input_tokens'] as int?,
-              outputTokens: usageJson['output_tokens'] as int?,
-              totalTokens: (usageJson['input_tokens'] as int? ?? 0) +
-                  (usageJson['output_tokens'] as int? ?? 0),
-            )
-          : AiUsage.empty;
-
       return AiResponse(
-        message: message,
-        finishReason: _parseFinishReason(json['stop_reason']),
-        usage: usage,
+        message: AiMessage(
+          role: AiMessageRole.assistant,
+          content: content.isEmpty ? [const AiTextContent('')] : content,
+        ),
+        finishReason:
+            _parseFinishReason(json['stop_reason']) ?? AiFinishReason.unknown,
+        usage: usageJson != null
+            ? _usage(
+                usageJson['input_tokens'] as int?,
+                usageJson['output_tokens'] as int?,
+              )
+            : AiUsage.empty,
         raw: json,
       );
     } catch (e) {
-      if (e is AiException) rethrow;
-      throw AiParsingException('Failed to parse Anthropic response: $e',
-          provider: 'Anthropic', rawResponse: jsonEncode(json));
-    }
-  }
-
-  AiMessage _parseAssistantContent(List<dynamic> contentBlocks) {
-    final contentParts = <AiContent>[];
-
-    for (final block in contentBlocks) {
-      final blockMap = block as Map<String, dynamic>;
-      final type = blockMap['type'] as String?;
-
-      if (type == 'text') {
-        final text = blockMap['text'] as String? ?? '';
-        if (text.isNotEmpty) {
-          contentParts.add(AiTextContent(text));
-        }
-      } else if (type == 'tool_use') {
-        contentParts.add(AiToolCallContent(
-          id: blockMap['id'] as String,
-          name: blockMap['name'] as String,
-          arguments: (blockMap['input'] as Map<String, dynamic>?) ?? {},
-        ));
-      }
-    }
-
-    if (contentParts.isEmpty) {
-      contentParts.add(const AiTextContent(''));
-    }
-
-    return AiMessage(
-      role: AiMessageRole.assistant,
-      content: contentParts,
-    );
-  }
-
-  AiStreamChunk _parseStreamChunk(Map<String, dynamic> json) {
-    final type = json['type'] as String?;
-
-    if (type == 'content_block_start') {
-      final contentBlock = json['content_block'] as Map<String, dynamic>?;
-      if (contentBlock?['type'] == 'tool_use') {
-        return AiStreamChunk(
-          content: [
-            AiToolCallContent(
-              id: contentBlock!['id'] as String? ?? '',
-              name: contentBlock['name'] as String? ?? '',
-              arguments: const {},
-            )
-          ],
-          raw: json,
-        );
-      }
-      return AiStreamChunk(raw: json);
-    }
-
-    if (type == 'content_block_delta') {
-      final delta = json['delta'] as Map<String, dynamic>?;
-      if (delta?['type'] == 'text_delta') {
-        final text = delta?['text'] as String? ?? '';
-        return AiStreamChunk(
-          content: [AiTextContent(text)],
-          raw: json,
-        );
-      }
-      if (delta?['type'] == 'input_json_delta') {
-        // Partial JSON for tool call arguments — emit as text for now
-        return AiStreamChunk(raw: json);
-      }
-    }
-
-    if (type == 'message_delta') {
-      final delta = json['delta'] as Map<String, dynamic>?;
-      final usageJson = json['usage'] as Map<String, dynamic>?;
-
-      return AiStreamChunk(
-        finishReason: _parseFinishReason(delta?['stop_reason']),
-        usage: usageJson != null
-            ? AiUsage(outputTokens: usageJson['output_tokens'] as int?)
-            : null,
-        raw: json,
+      throw AiParsingException(
+        'Failed to parse Anthropic response: $e',
+        provider: _provider,
+        rawResponse: jsonEncode(json),
       );
     }
-
-    return AiStreamChunk(raw: json);
   }
 
-  AiFinishReason _parseFinishReason(dynamic reason) {
+  AiStreamChunk? _parseStreamEvent(
+    Map<String, dynamic> json,
+    _StreamState state,
+  ) {
+    switch (json['type']) {
+      case 'message_start':
+        final message = json['message'] as Map<String, dynamic>?;
+        final usage = message?['usage'] as Map<String, dynamic>?;
+        state.inputTokens = usage?['input_tokens'] as int?;
+        return null;
+
+      case 'content_block_start':
+        final block = json['content_block'] as Map<String, dynamic>?;
+        if (block?['type'] == 'tool_use') {
+          state.toolCalls[json['index'] as int] = _ToolUseBuilder(
+            id: block!['id'] as String? ?? '',
+            name: block['name'] as String? ?? '',
+          );
+        }
+        return null;
+
+      case 'content_block_delta':
+        final delta = json['delta'] as Map<String, dynamic>?;
+        switch (delta?['type']) {
+          case 'text_delta':
+            final text = delta!['text'] as String? ?? '';
+            if (text.isEmpty) return null;
+            return AiStreamChunk(content: [AiTextContent(text)], raw: json);
+          case 'input_json_delta':
+            state.toolCalls[json['index']]?.json
+                .write(delta!['partial_json'] as String? ?? '');
+        }
+        return null;
+
+      case 'content_block_stop':
+        final builder = state.toolCalls.remove(json['index']);
+        if (builder == null) return null;
+        return AiStreamChunk(content: [builder.build()], raw: json);
+
+      case 'message_delta':
+        final delta = json['delta'] as Map<String, dynamic>?;
+        final usageJson = json['usage'] as Map<String, dynamic>?;
+        return AiStreamChunk(
+          finishReason: _parseFinishReason(delta?['stop_reason']),
+          usage: usageJson != null
+              ? _usage(
+                  (usageJson['input_tokens'] as int?) ?? state.inputTokens,
+                  usageJson['output_tokens'] as int?,
+                )
+              : null,
+          raw: json,
+        );
+
+      case 'error':
+        throw _streamError(json['error'] as Map<String, dynamic>?);
+    }
+    return null;
+  }
+
+  static AiException _streamError(Map<String, dynamic>? error) {
+    final type = error?['type'] as String?;
+    final message = 'Stream error: ${error?['message'] ?? type ?? 'unknown'}';
+    switch (type) {
+      case 'rate_limit_error':
+        return AiRateLimitException(message, provider: _provider);
+      case 'overloaded_error':
+        return AiProviderException(message,
+            provider: _provider, statusCode: 529);
+      case 'api_error':
+        return AiProviderException(message,
+            provider: _provider, statusCode: 500);
+      default:
+        return AiProviderException(message, provider: _provider);
+    }
+  }
+
+  static AiUsage _usage(int? input, int? output) => AiUsage(
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: (input ?? 0) + (output ?? 0),
+      );
+
+  static AiFinishReason? _parseFinishReason(Object? reason) {
     switch (reason) {
+      case null:
+        return null;
       case 'end_turn':
-        return AiFinishReason.stop;
-      case 'max_tokens':
-        return AiFinishReason.length;
       case 'stop_sequence':
         return AiFinishReason.stop;
+      case 'max_tokens':
+      case 'model_context_window_exceeded':
+        return AiFinishReason.length;
       case 'tool_use':
         return AiFinishReason.toolCalls;
+      case 'refusal':
+        return AiFinishReason.contentFilter;
       default:
         return AiFinishReason.unknown;
     }
   }
+}
+
+class _StreamState {
+  int? inputTokens;
+  final Map<int, _ToolUseBuilder> toolCalls = {};
+}
+
+class _ToolUseBuilder {
+  _ToolUseBuilder({required this.id, required this.name});
+
+  final String id;
+  final String name;
+  final StringBuffer json = StringBuffer();
+
+  AiToolCallContent build() => AiToolCallContent(
+        id: id,
+        name: name,
+        arguments: decodeJsonObject(json.toString()),
+      );
 }

@@ -18,19 +18,23 @@ class AiPromptTemplate {
   /// Creates a prompt template.
   const AiPromptTemplate(this.template);
 
+  static final _variablePattern = RegExp(r'\{\{(\w+)\}\}');
+  static final _placeholderPattern = RegExp(r'\{\{([^{}]+)\}\}');
+
   /// The set of variable names found in this template.
-  Set<String> get variables {
-    final regex = RegExp(r'\{\{(\w+)\}\}');
-    return regex.allMatches(template).map((m) => m.group(1)!).toSet();
-  }
+  Set<String> get variables =>
+      _variablePattern.allMatches(template).map((m) => m.group(1)!).toSet();
 
   /// Renders the template by replacing all `{{variable}}` placeholders
   /// with values from [values].
   ///
+  /// Substitution is single-pass: placeholders that appear inside inserted
+  /// values are left as-is, so untrusted input cannot expand other
+  /// variables. Extra entries in [values] are ignored.
+  ///
   /// Throws [ArgumentError] if any template variable is missing from [values].
   String render(Map<String, String> values) {
-    final requiredVars = variables;
-    final missingVars = requiredVars.difference(values.keys.toSet());
+    final missingVars = variables.difference(values.keys.toSet());
 
     if (missingVars.isNotEmpty) {
       throw ArgumentError(
@@ -38,11 +42,10 @@ class AiPromptTemplate {
       );
     }
 
-    String result = template;
-    for (final entry in values.entries) {
-      result = result.replaceAll('{{${entry.key}}}', entry.value);
-    }
-    return result;
+    return template.replaceAllMapped(
+      _placeholderPattern,
+      (m) => values[m.group(1)!] ?? m.group(0)!,
+    );
   }
 
   @override

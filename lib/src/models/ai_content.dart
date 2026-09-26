@@ -1,14 +1,22 @@
 import 'dart:typed_data';
 
+import 'ai_message.dart';
+
 /// Represents a piece of content within an [AiMessage].
+///
+/// This is a sealed hierarchy, so a `switch` over an [AiContent] can be
+/// checked for exhaustiveness.
 sealed class AiContent {
+  /// Base constructor for subclasses.
   const AiContent();
 }
 
 /// Represents text content within an [AiMessage].
 class AiTextContent extends AiContent {
+  /// The text.
   final String text;
 
+  /// Creates a text content part.
   const AiTextContent(this.text);
 }
 
@@ -20,6 +28,7 @@ class AiImageContent extends AiContent {
   /// The raw bytes of the image.
   final Uint8List bytes;
 
+  /// Creates an image content part from raw [bytes].
   const AiImageContent({
     required this.mimeType,
     required this.bytes,
@@ -34,6 +43,7 @@ class AiAudioContent extends AiContent {
   /// The raw bytes of the audio.
   final Uint8List bytes;
 
+  /// Creates an audio content part from raw [bytes].
   const AiAudioContent({
     required this.mimeType,
     required this.bytes,
@@ -48,6 +58,7 @@ class AiFileContent extends AiContent {
   /// The raw bytes of the file.
   final Uint8List bytes;
 
+  /// Creates a file content part from raw [bytes].
   const AiFileContent({
     required this.mimeType,
     required this.bytes,
@@ -63,12 +74,23 @@ class AiToolCallContent extends AiContent {
   final String name;
 
   /// The arguments provided by the model.
+  ///
+  /// Empty when the model supplied no arguments or produced invalid JSON.
   final Map<String, dynamic> arguments;
 
+  /// Opaque, provider-specific data that must be sent back to the provider
+  /// together with this tool call (for example Gemini's `thoughtSignature`).
+  ///
+  /// Providers populate and consume this automatically. Preserve it when
+  /// persisting and restoring conversations that contain tool calls.
+  final Map<String, dynamic> metadata;
+
+  /// Creates a tool call content part.
   const AiToolCallContent({
     required this.id,
     required this.name,
     required this.arguments,
+    this.metadata = const {},
   });
 }
 
@@ -81,11 +103,15 @@ class AiToolResultContent extends AiContent {
   final String name;
 
   /// The result of the execution.
+  ///
+  /// Strings are sent verbatim; other values are JSON-encoded (using
+  /// `toJson()` when available, otherwise `toString()`).
   final dynamic result;
 
   /// Whether the tool execution resulted in an error.
   final bool isError;
 
+  /// Creates a tool result content part.
   const AiToolResultContent({
     required this.id,
     required this.name,

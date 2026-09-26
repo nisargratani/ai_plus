@@ -5,6 +5,7 @@ class AiEmbedding {
   /// The floating point vector representation of the input text.
   final List<double> vector;
 
+  /// Creates an embedding from its [vector].
   const AiEmbedding(this.vector);
 }
 
@@ -16,11 +17,14 @@ class AiEmbeddingResult {
   /// The usage statistics for this request.
   final AiUsage usage;
 
+  /// Creates an embedding result.
   const AiEmbeddingResult({
     required this.embeddings,
     this.usage = AiUsage.empty,
   });
 
   /// Convenience getter for the first embedding vector.
+  ///
+  /// Throws a [StateError] if [embeddings] is empty.
   List<double> get vector => embeddings.first.vector;
 }

@@ -1,10 +1,9 @@
 import 'dart:convert';
-import 'package:test/test.dart';
+
+import 'package:ai_plus/ai_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:ai_plus/ai_plus.dart';
-import 'package:ai_plus/src/http/ai_http_client.dart';
-import 'package:ai_plus/src/providers/gemini/gemini_provider.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('GeminiProvider', () {
@@ -26,7 +25,11 @@ void main() {
 
     test('chat returns parsed response', () async {
       final mock = MockClient((request) async {
-        expect(request.url.queryParameters['key'], 'test-key');
+        // The key must travel in a header, never in the URL, where it could
+        // leak into logs and exception messages.
+        expect(request.headers['x-goog-api-key'], 'test-key');
+        expect(request.url.queryParameters.containsKey('key'), isFalse);
+        expect(request.url.toString(), isNot(contains('test-key')));
         return http.Response(
           jsonEncode({
             'candidates': [

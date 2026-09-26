@@ -1,6 +1,6 @@
 import '../models/ai_message.dart';
-import '../tools/ai_tool.dart';
 import '../structured_output/schema.dart';
+import '../tools/ai_tool.dart';
 
 /// Represents a request to an AI provider.
 ///
@@ -16,7 +16,8 @@ class AiRequest {
   /// The maximum number of tokens to generate.
   final int? maxTokens;
 
-  /// The sampling temperature to use, between 0 and 2.
+  /// The sampling temperature to use (0–2 for OpenAI and Gemini, 0–1 for
+  /// Anthropic).
   ///
   /// Higher values (e.g. 0.8) make output more random, lower values
   /// (e.g. 0.2) make it more focused and deterministic.
@@ -39,6 +40,7 @@ class AiRequest {
   /// will use this to constrain the model's response format.
   final AiJsonSchema? schema;
 
+  /// Creates a request.
   const AiRequest({
     required this.messages,
     this.model,
@@ -50,7 +52,9 @@ class AiRequest {
     this.schema,
   });
 
-  /// Creates a copy of this request with the given fields replaced with the new values.
+  /// Creates a copy of this request with the given fields replaced.
+  ///
+  /// Fields cannot be reset to `null` through this method.
   AiRequest copyWith({
     List<AiMessage>? messages,
     String? model,

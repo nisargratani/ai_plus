@@ -1,17 +1,20 @@
-// Comprehensive example demonstrating all features of `ai_plus`.
+// A tour of the main `ai_plus` features.
 //
 // Run with:
 //   OPENAI_API_KEY=sk-... dart run example/example.dart
+//
+// Swap the provider (see step 1) to run the same code against Gemini,
+// Claude or a local Ollama server.
 import 'dart:io';
 import 'package:ai_plus/ai_plus.dart';
 
-void main() async {
+Future<void> main() async {
   // ──────────────────────────────────────────────────────────────────────
   // 1. INITIALIZATION — Provider-Agnostic Setup
   // ──────────────────────────────────────────────────────────────────────
 
   final apiKey = Platform.environment['OPENAI_API_KEY'];
-  if (apiKey == null) {
+  if (apiKey == null || apiKey.isEmpty) {
     print('Please set OPENAI_API_KEY environment variable.');
     return;
   }
@@ -30,7 +33,7 @@ void main() async {
     defaultModel: 'gpt-4o-mini',
     timeout: const Duration(seconds: 60),
     retryPolicy: const AiRetryPolicy(maxAttempts: 3, backoffFactor: 2.0),
-    cache: MemoryAiCache(ttl: const Duration(minutes: 30)),
+    cache: MemoryAiCache(ttl: const Duration(minutes: 30), maxEntries: 100),
     logger: const ConsoleAiLogger(enableDebug: false),
     middlewares: [metrics],
   );
@@ -40,6 +43,19 @@ void main() async {
   // provider: AiProvider.anthropic(apiKey: claudeKey),
   // provider: AiProvider.custom(baseUrl: 'http://localhost:11434/v1', apiKey: ''),
 
+  try {
+    await _tour(ai, metrics, costTracker);
+  } finally {
+    // Releases the provider's HTTP connections.
+    ai.close();
+  }
+}
+
+Future<void> _tour(
+  AiClient ai,
+  MetricsMiddleware metrics,
+  AiCostTracker costTracker,
+) async {
   // ──────────────────────────────────────────────────────────────────────
   // 2. SIMPLE CHAT
   // ──────────────────────────────────────────────────────────────────────
@@ -121,7 +137,7 @@ void main() async {
       },
       required: ['city'],
     ),
-    execute: (args) async => {'temp': '72°F', 'condition': 'sunny'},
+    execute: (args) async => {'temp': '22°C', 'condition': 'sunny'},
   );
 
   final toolResponse = await ai.chat(
@@ -135,10 +151,9 @@ void main() async {
     print('Model wants to call: ${toolCalls.first.name}');
     print('With args: ${toolCalls.first.arguments}');
 
-    // Execute the tool
-    final executor = ToolExecutor([weatherTool]);
-    final result = await executor.execute(toolCalls.first);
-    print('Tool result: ${result.result}');
+    // Execute the requested tools (AiAgent below automates this loop).
+    final results = await ToolExecutor([weatherTool]).executeAll(toolCalls);
+    print('Tool result: ${results.first.result}');
   } else {
     print('AI: ${toolResponse.text}');
   }
@@ -165,7 +180,23 @@ void main() async {
   }
 
   // ──────────────────────────────────────────────────────────────────────
-  // 9. PROMPT TEMPLATES
+  // 9. EMBEDDINGS & RAG
+  // ──────────────────────────────────────────────────────────────────────
+
+  print('\n═══ Knowledge Base (RAG) ═══');
+  final kb = AiKnowledgeBase(client: ai);
+  await kb.ingestBatch(
+    ids: ['dart', 'flutter'],
+    contents: [
+      'Dart is a client-optimized language created by Google in 2011.',
+      'Flutter is a UI toolkit that uses Dart to build cross-platform apps.',
+    ],
+  );
+  final answer = await kb.ask('Which language does Flutter use?', k: 1);
+  print('Answer: ${answer.text}');
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 10. PROMPT TEMPLATES
   // ──────────────────────────────────────────────────────────────────────
 
   print('\n═══ Prompt Templates ═══');
@@ -180,24 +211,26 @@ void main() async {
   print('Rendered: $prompt');
 
   // ──────────────────────────────────────────────────────────────────────
-  // 10. ERROR HANDLING
+  // 11. ERROR HANDLING
   // ──────────────────────────────────────────────────────────────────────
 
   print('\n═══ Error Handling ═══');
+  final badClient = AiClient(
+    provider: AiProvider.openAI(apiKey: 'invalid-key'),
+    retryPolicy: AiRetryPolicy.none,
+  );
   try {
-    final badClient = AiClient(
-      provider: AiProvider.openAI(apiKey: 'invalid-key'),
-      retryPolicy: AiRetryPolicy.none,
-    );
     await badClient.chat(messages: [AiMessage.user('Hello')]);
   } on AiAuthenticationException catch (e) {
     print('Auth error (expected): ${e.message}');
   } on AiException catch (e) {
     print('AI error: $e');
+  } finally {
+    badClient.close();
   }
 
   // ──────────────────────────────────────────────────────────────────────
-  // 11. COST TRACKING & METRICS
+  // 12. COST TRACKING & METRICS
   // ──────────────────────────────────────────────────────────────────────
 
   print('\n═══ Cost Tracking & Metrics ═══');

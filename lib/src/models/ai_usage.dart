@@ -9,6 +9,7 @@ class AiUsage {
   /// The total number of tokens used.
   final int? totalTokens;
 
+  /// Creates a usage record. Unknown counts are `null`.
   const AiUsage({
     this.inputTokens,
     this.outputTokens,
