@@ -2,8 +2,7 @@ import '../models/ai_usage.dart';
 
 /// Tracks token usage and estimated costs across multiple AI requests.
 ///
-/// Usage is accumulated automatically when you pass a tracker to [AiClient]
-/// or call [addUsage] manually.
+/// Record each response's usage with [addUsage].
 ///
 /// ```dart
 /// final tracker = AiCostTracker();

@@ -1,8 +1,15 @@
 import 'dart:math';
 
 /// Defines how the SDK should retry failed requests.
+///
+/// Delays grow as `initialDelay * backoffFactor^attempt`, capped at
+/// [maxDelay], with ±20% jitter when [jitter] is enabled.
 class AiRetryPolicy {
-  /// The maximum number of retry attempts.
+  static final _random = Random();
+
+  /// The maximum number of retries after the initial attempt.
+  ///
+  /// A value of 3 allows up to 4 calls in total; 0 disables retries.
   final int maxAttempts;
 
   /// The initial delay before the first retry.
@@ -17,6 +24,7 @@ class AiRetryPolicy {
   /// Whether to add jitter (randomness) to the delay to prevent thundering herd problems.
   final bool jitter;
 
+  /// Creates a retry policy.
   const AiRetryPolicy({
     this.maxAttempts = 3,
     this.initialDelay = const Duration(milliseconds: 500),
@@ -36,11 +44,10 @@ class AiRetryPolicy {
     var finalDelayMs = min(delayMs, maxDelay.inMilliseconds.toDouble());
 
     if (jitter) {
-      final random = Random();
       // Jitter up to 20%
       final jitterAmount = finalDelayMs * 0.2;
       final jitterValue =
-          (random.nextDouble() * jitterAmount * 2) - jitterAmount;
+          (_random.nextDouble() * jitterAmount * 2) - jitterAmount;
       finalDelayMs += jitterValue;
     }
 

@@ -1,6 +1,6 @@
+import '../models/ai_finish_reason.dart';
 import '../models/ai_message.dart';
 import '../models/ai_usage.dart';
-import '../models/ai_finish_reason.dart';
 
 /// Represents a response from an AI provider.
 class AiResponse {
@@ -16,6 +16,7 @@ class AiResponse {
   /// The raw JSON response from the provider (optional, for advanced use cases).
   final Map<String, dynamic>? raw;
 
+  /// Creates a response.
   const AiResponse({
     required this.message,
     this.finishReason = AiFinishReason.unknown,
@@ -23,6 +24,6 @@ class AiResponse {
     this.raw,
   });
 
-  /// Convenience getter for the generated text.
+  /// Convenience getter for the generated text ([AiMessage.text]).
   String get text => message.text;
 }

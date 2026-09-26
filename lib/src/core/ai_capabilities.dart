@@ -21,6 +21,7 @@ class AiCapabilities {
   /// Whether the provider supports accepting arbitrary file inputs.
   final bool fileInput;
 
+  /// Creates a capability set; every capability defaults to `false`.
   const AiCapabilities({
     this.streaming = false,
     this.toolCalling = false,

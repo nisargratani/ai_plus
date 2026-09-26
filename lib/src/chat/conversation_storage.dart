@@ -37,6 +37,9 @@ abstract interface class AiConversationStorage {
 /// Useful for testing and simple applications. Data is lost when
 /// the application exits.
 class InMemoryConversationStorage implements AiConversationStorage {
+  /// Creates an empty in-memory storage.
+  InMemoryConversationStorage();
+
   final Map<String, List<AiMessage>> _store = {};
 
   @override

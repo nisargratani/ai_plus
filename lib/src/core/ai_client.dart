@@ -1,21 +1,23 @@
 import 'dart:convert';
-import '../models/ai_message.dart';
-import '../tools/ai_tool.dart';
-import '../structured_output/schema.dart';
+
+import '../cache/ai_cache.dart';
 import '../chat/conversation.dart';
 import '../embeddings/embedding_service.dart';
+import '../errors/ai_exception.dart';
+import '../logging/ai_logger.dart';
+import '../middleware/ai_middleware.dart';
+import '../middleware/cache_middleware.dart';
+import '../middleware/logging_middleware.dart';
+import '../middleware/retry_middleware.dart';
+import '../models/ai_message.dart';
+import '../providers/closeable_provider.dart';
+import '../retry/retry_policy.dart';
+import '../structured_output/schema.dart';
+import '../tools/ai_tool.dart';
 import 'ai_provider.dart';
 import 'ai_request.dart';
 import 'ai_response.dart';
 import 'ai_stream.dart';
-import '../errors/ai_exception.dart';
-import '../logging/ai_logger.dart';
-import '../retry/retry_policy.dart';
-import '../cache/ai_cache.dart';
-import '../middleware/ai_middleware.dart';
-import '../middleware/retry_middleware.dart';
-import '../middleware/cache_middleware.dart';
-import '../middleware/logging_middleware.dart';
 
 /// The main entry point for the `ai_plus` SDK.
 ///
@@ -42,10 +44,17 @@ class AiClient {
   /// The default model to use if one is not specified in the request.
   final String? defaultModel;
 
-  /// The maximum duration to wait for a request before throwing a timeout exception.
+  /// The maximum duration to wait for a request before throwing an
+  /// [AiTimeoutException].
+  ///
+  /// For [chat] this bounds each attempt; for [stream] it bounds the gap
+  /// between consecutive chunks (an idle timeout), so long streams that keep
+  /// producing output are not cut off.
   final Duration? timeout;
 
-  /// The retry policy. Defaults to a standard exponential backoff with 3 attempts.
+  /// The retry policy. Defaults to exponential backoff with up to 3 retries.
+  ///
+  /// Use [AiRetryPolicy.none] to disable retries.
   final AiRetryPolicy retryPolicy;
 
   /// The logger used for debugging and info.
@@ -55,26 +64,27 @@ class AiClient {
   final AiCache? cache;
 
   /// Custom middleware to be executed before built-in middlewares.
+  ///
+  /// The effective order is: [middlewares] → logging → cache → retry →
+  /// provider (with [timeout]).
   final List<AiMiddleware> middlewares;
 
   /// Service for creating embeddings.
   late final AiEmbeddingService embeddings;
 
-  List<AiMiddleware> get _allMiddlewares {
-    final list = <AiMiddleware>[...middlewares];
+  /// Built-in middleware derived from the constructor arguments.
+  late final List<AiMiddleware> _builtInMiddlewares = [
+    if (logger case final logger?) LoggingMiddleware(logger),
+    if (cache case final cache?) CacheMiddleware(cache),
+    if (retryPolicy.maxAttempts > 0)
+      RetryMiddleware(policy: retryPolicy, logger: logger),
+  ];
 
-    if (logger != null) {
-      list.add(LoggingMiddleware(logger!));
-    }
-    if (cache != null) {
-      list.add(CacheMiddleware(cache!));
-    }
-    if (retryPolicy.maxAttempts > 0) {
-      list.add(RetryMiddleware(policy: retryPolicy, logger: logger));
-    }
+  /// [middlewares] is read on every call so later additions take effect.
+  List<AiMiddleware> get _allMiddlewares =>
+      [...middlewares, ..._builtInMiddlewares];
 
-    return list;
-  }
+  String get _providerName => provider.runtimeType.toString();
 
   /// Creates an [AiClient] with the given [provider] and optional configuration.
   ///
@@ -134,6 +144,9 @@ class AiClient {
   /// Throws [AiTimeoutException] when the request exceeds the configured timeout.
   /// Throws [AiUnsupportedCapabilityException] when the provider doesn't support
   /// a requested feature (e.g. tools when toolCalling is false).
+  ///
+  /// All errors, including validation errors, are delivered through the
+  /// returned [Future].
   Future<AiResponse> chat({
     required List<AiMessage> messages,
     String? model,
@@ -143,22 +156,13 @@ class AiClient {
     List<String>? stop,
     List<AiTool>? tools,
     AiJsonSchema? schema,
-  }) {
-    // Validate tool calling capability
-    if (tools != null &&
-        tools.isNotEmpty &&
-        !provider.capabilities.toolCalling) {
-      throw AiUnsupportedCapabilityException(
-        'The configured provider does not support tool calling.',
-        provider: provider.runtimeType.toString(),
-      );
-    }
+  }) async {
+    _checkToolSupport(tools);
 
-    // Validate structured output capability
     if (schema != null && !provider.capabilities.structuredOutput) {
       throw AiUnsupportedCapabilityException(
         'The configured provider does not support structured output.',
-        provider: provider.runtimeType.toString(),
+        provider: _providerName,
       );
     }
 
@@ -182,7 +186,7 @@ class AiClient {
       handler = (req) => middleware.handleChat(req, next);
     }
 
-    return handler(request);
+    return await handler(request);
   }
 
   /// Sends a request to the configured AI provider and streams the response.
@@ -190,7 +194,8 @@ class AiClient {
   /// Returns a [Stream] of [AiStreamChunk]s. Each chunk may contain partial text,
   /// tool calls, or usage information.
   ///
-  /// Supports cancellation via standard [StreamSubscription.cancel].
+  /// Cancelling the subscription (e.g. breaking out of `await for`) aborts
+  /// the underlying HTTP request.
   ///
   /// ```dart
   /// await for (final chunk in ai.stream(messages: [...])) {
@@ -198,7 +203,13 @@ class AiClient {
   /// }
   /// ```
   ///
-  /// Throws [AiUnsupportedCapabilityException] if the provider doesn't support streaming.
+  /// Tool calls are emitted once, with complete arguments, typically in the
+  /// final chunk. [AiStreamChunk.finishReason] is non-null only on the chunk
+  /// that ends the generation.
+  ///
+  /// Emits [AiUnsupportedCapabilityException] if the provider doesn't support
+  /// streaming (or tools, when [tools] is non-empty). All errors are delivered
+  /// through the stream.
   Stream<AiStreamChunk> stream({
     required List<AiMessage> messages,
     String? model,
@@ -208,11 +219,16 @@ class AiClient {
     List<String>? stop,
     List<AiTool>? tools,
   }) {
-    if (!provider.capabilities.streaming) {
-      throw AiUnsupportedCapabilityException(
-        'The configured provider does not support streaming.',
-        provider: provider.runtimeType.toString(),
-      );
+    try {
+      if (!provider.capabilities.streaming) {
+        throw AiUnsupportedCapabilityException(
+          'The configured provider does not support streaming.',
+          provider: _providerName,
+        );
+      }
+      _checkToolSupport(tools);
+    } on AiException catch (e, st) {
+      return Stream.error(e, st);
     }
 
     final request = AiRequest(
@@ -265,8 +281,10 @@ class AiClient {
 
   /// Generates a structured output and decodes it into a Dart object.
   ///
-  /// The method sends a chat request with an optional [schema] hint, extracts
-  /// JSON from the response, and passes it through the [decoder] function.
+  /// Providers with native structured output (OpenAI, Gemini, custom) receive
+  /// [schema] as a response-format constraint. For other providers (such as
+  /// Anthropic) the schema is added to the prompt as an instruction. The
+  /// first JSON object found in the reply is then passed to [decoder].
   ///
   /// ```dart
   /// final profile = await ai.generate<UserProfile>(
@@ -285,12 +303,21 @@ class AiClient {
     int? maxTokens,
     double? temperature,
   }) async {
+    final native = provider.capabilities.structuredOutput;
     final response = await chat(
-      messages: [AiMessage.user(prompt)],
+      messages: [
+        if (!native)
+          AiMessage.system(
+            'Respond only with a single JSON object, with no surrounding '
+            'text or code fences, that conforms to this JSON Schema:\n'
+            '${jsonEncode(schema.toJson())}',
+          ),
+        AiMessage.user(prompt),
+      ],
       model: model,
       maxTokens: maxTokens,
       temperature: temperature,
-      schema: provider.capabilities.structuredOutput ? schema : null,
+      schema: native ? schema : null,
     );
 
     final text = response.text;
@@ -302,58 +329,90 @@ class AiClient {
     if (jsonStart == -1 || jsonEnd == -1 || jsonStart > jsonEnd) {
       throw AiStructuredOutputException(
         'Failed to extract JSON from response',
-        provider: provider.runtimeType.toString(),
+        provider: _providerName,
         rawResponse: text,
       );
     }
 
     final jsonStr = text.substring(jsonStart, jsonEnd + 1);
 
+    final Map<String, dynamic> decoded;
     try {
-      final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
-      return decoder(decoded);
+      decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
     } catch (e) {
       throw AiStructuredOutputException(
         'Failed to decode JSON: $e',
-        provider: provider.runtimeType.toString(),
+        provider: _providerName,
+        rawResponse: jsonStr,
+      );
+    }
+
+    try {
+      return decoder(decoded);
+    } catch (e) {
+      throw AiStructuredOutputException(
+        'Decoder rejected the JSON: $e',
+        provider: _providerName,
         rawResponse: jsonStr,
       );
     }
   }
 
-  /// Closes the client and releases any resources.
+  /// Closes the client and releases the provider's HTTP connections.
   ///
-  /// After calling this method, the client should not be used.
+  /// Built-in providers close only HTTP clients they created themselves;
+  /// an `AiHttpClient` you passed in stays open. After calling this method
+  /// the client should not be used.
   void close() {
-    // Provider implementations may hold HTTP clients
-    // This is a no-op for the base client but signals intent
+    final Object provider = this.provider;
+    if (provider is CloseableProvider) provider.close();
+  }
+
+  void _checkToolSupport(List<AiTool>? tools) {
+    if (tools != null &&
+        tools.isNotEmpty &&
+        !provider.capabilities.toolCalling) {
+      throw AiUnsupportedCapabilityException(
+        'The configured provider does not support tool calling.',
+        provider: _providerName,
+      );
+    }
   }
 
   Future<AiResponse> _executeProviderChat(AiRequest request) {
-    Future<AiResponse> future = provider.chat(request);
+    final future = provider.chat(request);
+    final timeout = this.timeout;
+    if (timeout == null) return future;
 
-    if (timeout != null) {
-      future = future.timeout(
-        timeout!,
-        onTimeout: () => throw AiTimeoutException(
-            'Request timed out after ${timeout!.inSeconds} seconds'),
-      );
-    }
-
-    return future;
+    return future.timeout(
+      timeout,
+      onTimeout: () => throw AiTimeoutException(
+        'Request timed out after ${_describe(timeout)}',
+        provider: _providerName,
+      ),
+    );
   }
 
   Stream<AiStreamChunk> _executeProviderStream(AiRequest request) {
-    Stream<AiStreamChunk> resultStream = provider.stream(request);
+    final stream = provider.stream(request);
+    final timeout = this.timeout;
+    if (timeout == null) return stream;
 
-    if (timeout != null) {
-      resultStream = resultStream.timeout(
-        timeout!,
-        onTimeout: (sink) => sink.addError(AiTimeoutException(
-            'Stream timed out after ${timeout!.inSeconds} seconds')),
-      );
-    }
-
-    return resultStream;
+    return stream.timeout(
+      timeout,
+      onTimeout: (sink) {
+        sink
+          ..addError(AiTimeoutException(
+            'Stream received no data for ${_describe(timeout)}',
+            provider: _providerName,
+          ))
+          // Closing cancels the underlying request.
+          ..close();
+      },
+    );
   }
+
+  static String _describe(Duration d) => d.inMilliseconds % 1000 == 0
+      ? '${d.inSeconds} seconds'
+      : '${d.inMilliseconds} ms';
 }

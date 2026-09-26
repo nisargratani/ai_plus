@@ -5,6 +5,9 @@ import 'ai_middleware.dart';
 
 /// Middleware that tracks request metrics such as count, latency, and errors.
 ///
+/// Counts logical requests: when placed in `AiClient.middlewares` it runs
+/// before the retry middleware, so retried attempts count once.
+///
 /// ```dart
 /// final metrics = MetricsMiddleware();
 /// final ai = AiClient(
@@ -17,6 +20,9 @@ import 'ai_middleware.dart';
 /// print('Error count: ${metrics.errorCount}');
 /// ```
 class MetricsMiddleware implements AiMiddleware {
+  /// Creates a metrics middleware with all counters at zero.
+  MetricsMiddleware();
+
   int _requestCount = 0;
   int _errorCount = 0;
   Duration _totalLatency = Duration.zero;
@@ -52,21 +58,33 @@ class MetricsMiddleware implements AiMiddleware {
     final stopwatch = Stopwatch()..start();
 
     try {
-      final response = await next(request);
-      stopwatch.stop();
-      _totalLatency += stopwatch.elapsed;
-      return response;
-    } catch (e) {
-      stopwatch.stop();
-      _totalLatency += stopwatch.elapsed;
+      return await next(request);
+    } catch (_) {
       _errorCount++;
       rethrow;
+    } finally {
+      _totalLatency += stopwatch.elapsed;
     }
   }
 
+  /// Counts the stream as one request; its latency is measured until the
+  /// stream completes, fails or is cancelled.
   @override
-  Stream<AiStreamChunk> handleStream(AiRequest request, AiStreamHandler next) {
+  Stream<AiStreamChunk> handleStream(
+      AiRequest request, AiStreamHandler next) async* {
     _requestCount++;
-    return next(request);
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      // `await for` (unlike `yield*`) rethrows stream errors here.
+      await for (final chunk in next(request)) {
+        yield chunk;
+      }
+    } catch (_) {
+      _errorCount++;
+      rethrow;
+    } finally {
+      _totalLatency += stopwatch.elapsed;
+    }
   }
 }

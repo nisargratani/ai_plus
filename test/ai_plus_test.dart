@@ -1,5 +1,5 @@
-import 'package:test/test.dart';
 import 'package:ai_plus/ai_plus.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('ai_plus core tests', () {

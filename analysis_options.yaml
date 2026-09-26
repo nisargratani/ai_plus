@@ -8,6 +8,21 @@ analyzer:
 
 linter:
   rules:
+    # Public API quality
+    - public_member_api_docs
+    - comment_references
+    - always_declare_return_types
+    - type_annotate_public_apis
+    # Async correctness
+    - unawaited_futures
+    - cancel_subscriptions
+    - close_sinks
+    # Error handling
+    - only_throw_errors
+    - use_rethrow_when_possible
+    # Style
     - prefer_const_constructors
     - prefer_const_declarations
     - prefer_final_locals
+    - prefer_single_quotes
+    - directives_ordering
