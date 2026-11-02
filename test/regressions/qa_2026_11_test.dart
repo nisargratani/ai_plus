@@ -1530,6 +1530,86 @@ void main() {
       expect((agentError as AiToolException).provider, 'FakeProvider');
     });
   });
+
+  group('AiKnowledgeBase cancellation (0.1.1)', () {
+    test('ask passes the trigger to the answer request', () async {
+      final provider = FakeProvider();
+      final kb = AiKnowledgeBase(client: AiClient(provider: provider));
+      await kb.ingest(id: 'a', content: 'Dart was created by Google.');
+      final trigger = Completer<void>().future;
+
+      await kb.ask('Who created Dart?', abortTrigger: trigger);
+      expect(provider.requests.single.abortTrigger, same(trigger));
+    });
+
+    test('ask does not start the answer once the trigger fired', () async {
+      final provider = FakeProvider();
+      final kb = AiKnowledgeBase(client: AiClient(provider: provider));
+      final error = await _errorOf(
+          kb.ask('Who created Dart?', abortTrigger: Future<void>.value()));
+      expect(error, isA<AiTimeoutException>());
+      expect((error as AiException).provider, 'FakeProvider');
+      expect(provider.requests, isEmpty);
+    });
+
+    test('ingestBatch stops between slices and stores nothing', () async {
+      final cancel = Completer<void>();
+      var requests = 0;
+      final ai = AiClient(
+        provider: AiProvider.openAI(
+          apiKey: 'k',
+          httpClient: AiHttpClient(
+            client: MockClient((req) async {
+              requests++;
+              if (!cancel.isCompleted) cancel.complete();
+              final n = ((jsonDecode(req.body) as Map)['input'] as List).length;
+              return _json({
+                'data': [
+                  for (var i = 0; i < n; i++)
+                    {
+                      'index': i,
+                      'embedding': [1.0],
+                    },
+                ],
+              });
+            }),
+          ),
+        ),
+      );
+      final store = _RecordingStore();
+      final kb = AiKnowledgeBase(client: ai, store: store);
+
+      final error = await _errorOf(kb.ingestBatch(
+        contents: [for (var i = 0; i < 300; i++) 'doc $i'],
+        abortTrigger: cancel.future,
+      ));
+      expect(error, isA<AiTimeoutException>());
+      expect((error as AiException).provider, 'OpenAI');
+      expect(requests, 1);
+      expect(store.documents, isEmpty);
+    });
+
+    test('a trigger completed before ingestBatch sends nothing', () async {
+      var requests = 0;
+      final ai = AiClient(
+        provider: AiProvider.openAI(
+          apiKey: 'k',
+          httpClient: AiHttpClient(
+            client: MockClient((_) async {
+              requests++;
+              return _json({'data': <Object>[]});
+            }),
+          ),
+        ),
+      );
+      final kb = AiKnowledgeBase(client: ai, store: _RecordingStore());
+      expect(
+          await _errorOf(kb.ingestBatch(
+              contents: ['a'], abortTrigger: Future<void>.value())),
+          isA<AiTimeoutException>());
+      expect(requests, 0);
+    });
+  });
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

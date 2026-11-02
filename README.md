@@ -337,10 +337,11 @@ final ai = AiClient(
   or API keys.
 
 **Cancelling a request:** pass an `abortTrigger` to `chat`, `stream`,
-`generate`, `conversation.send`/`stream` or `agent.run`. When the future
-completes, the HTTP request (or response stream) is aborted and the call
-fails with `AiTimeoutException`; it is not retried, and an agent starts no
-further tools.
+`generate`, `conversation.send`/`stream`, `agent.run`, or the knowledge
+base's `ask` and `ingestBatch`. When the future completes, the HTTP request
+(or response stream) is aborted and the call fails with `AiTimeoutException`;
+it is not retried, an agent starts no further tools, and `ingestBatch`
+stores nothing. Embeddings requests already in flight run to completion.
 
 ```dart
 final cancel = Completer<void>();

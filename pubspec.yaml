@@ -2,7 +2,7 @@ name: ai_plus
 description: >-
   Provider-agnostic AI SDK for Dart and Flutter: one API for OpenAI, Gemini,
   Claude and OpenAI-compatible servers, with streaming, tools, agents and RAG.
-version: 0.1.0
+version: 0.1.1
 repository: https://github.com/nisargratani/ai_plus
 issue_tracker: https://github.com/nisargratani/ai_plus/issues
 topics:

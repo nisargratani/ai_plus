@@ -1,7 +1,5 @@
 // ignore_for_file: prefer_initializing_formals
 
-import 'dart:async';
-
 import '../core/ai_client.dart';
 import '../errors/ai_exception.dart';
 import '../models/ai_content.dart';
@@ -9,6 +7,7 @@ import '../models/ai_message.dart';
 import '../providers/provider_name.dart';
 import '../tools/ai_tool.dart';
 import '../tools/tool_executor.dart';
+import '../utils/abort_trigger.dart';
 
 /// A high-level autonomous agent capable of using tools to achieve a goal.
 ///
@@ -80,13 +79,9 @@ class AiAgent {
   /// [maxIterations] tool rounds. Those last tool calls are not executed, so
   /// no tool side effect happens without its result reaching the model.
   Future<String> run(String prompt, {Future<void>? abortTrigger}) async {
-    var aborted = false;
-    if (abortTrigger != null) {
-      unawaited(abortTrigger.then((_) => aborted = true,
-          onError: (Object _) => aborted = true));
-    }
+    final aborted = watchAbortTrigger(abortTrigger);
     void checkAborted() {
-      if (aborted) {
+      if (aborted()) {
         throw AiTimeoutException('Agent run aborted',
             provider: providerName(_client.provider));
       }

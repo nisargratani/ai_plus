@@ -1,3 +1,26 @@
+## 0.1.1
+
+Completes the cancellation support added in 0.1.0. No behaviour changes for
+existing code.
+
+### New features
+
+- `AiKnowledgeBase.ask` and `AiKnowledgeBase.ingestBatch` accept
+  `abortTrigger`, like the other chat entry points. Completing it fails the
+  call with `AiTimeoutException`:
+  - `ask` aborts the answer request, or does not start it if the trigger
+    fires during the search. The search's embeddings request runs to
+    completion.
+  - `ingestBatch` sends no further slice and stores nothing. A slice
+    already in flight finishes.
+
+### Documentation
+
+- The example shows cancelling a request with `abortTrigger`, the usage
+  breakdown (`AiUsage` now prints reasoning and cached tokens), and
+  describing an OpenAI-compatible server with `capabilities`.
+- The README lists every method that accepts `abortTrigger`.
+
 ## 0.1.0
 
 This release fixes 19 issues found in an external QA pass (2026-11-02) and
