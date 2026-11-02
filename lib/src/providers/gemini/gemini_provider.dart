@@ -417,6 +417,8 @@ class GeminiProvider implements AiProvider, CloseableProvider {
       inputTokens: sum('promptTokenCount', 'toolUsePromptTokenCount'),
       outputTokens: sum('candidatesTokenCount', 'thoughtsTokenCount'),
       totalTokens: json['totalTokenCount'] as int?,
+      reasoningTokens: json['thoughtsTokenCount'] as int?,
+      cachedInputTokens: json['cachedContentTokenCount'] as int?,
     );
   }
 

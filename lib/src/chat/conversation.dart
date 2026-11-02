@@ -68,8 +68,11 @@ class AiConversation {
   /// together once the request succeeds. If the request fails the history is
   /// left unchanged, so the call can simply be retried.
   ///
+  /// Completing [abortTrigger] cancels the request (see [AiClient.chat]);
+  /// the history is then left unchanged.
+  ///
   /// Calls should not overlap: await each [send] before the next one.
-  Future<AiResponse> send(String text) async {
+  Future<AiResponse> send(String text, {Future<void>? abortTrigger}) async {
     final userMessage = AiMessage.user(text);
 
     final response = await _client.chat(
@@ -78,6 +81,7 @@ class AiConversation {
       tools: tools,
       maxTokens: maxTokens,
       temperature: temperature,
+      abortTrigger: abortTrigger,
     );
 
     _messages
@@ -90,7 +94,8 @@ class AiConversation {
   ///
   /// When the stream completes successfully, the user message and the full
   /// assistant response (assembled from the chunks) are added to the
-  /// history. If the stream fails or is cancelled, the history is left
+  /// history. If the stream fails or is cancelled (by cancelling the
+  /// subscription or completing [abortTrigger]), the history is left
   /// unchanged.
   ///
   /// ```dart
@@ -99,7 +104,10 @@ class AiConversation {
   /// }
   /// // After the stream completes, the full response is in conversation.messages
   /// ```
-  Stream<AiStreamChunk> stream(String text) async* {
+  Stream<AiStreamChunk> stream(
+    String text, {
+    Future<void>? abortTrigger,
+  }) async* {
     final userMessage = AiMessage.user(text);
     final textBuffer = StringBuffer();
     final otherContent = <AiContent>[];
@@ -110,6 +118,7 @@ class AiConversation {
       tools: tools,
       maxTokens: maxTokens,
       temperature: temperature,
+      abortTrigger: abortTrigger,
     )) {
       for (final part in chunk.content) {
         if (part is AiTextContent) {

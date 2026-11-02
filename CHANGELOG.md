@@ -1,10 +1,11 @@
 ## 0.1.0
 
-This release fixes 19 issues found in an external QA pass (2026-11-02). The
-API only grows, so code that calls it compiles unchanged. Classes that
-override `AiHttpClient.post`, `postStream` or `postSse`, or implement
-`AiRequest`, need the new `abortTrigger` parameter. Callers can observe
-several behaviour changes, listed below, so the minor version is bumped.
+This release fixes 19 issues found in an external QA pass (2026-11-02) and
+revisits several defaults. The API only grows, so code that calls it
+compiles unchanged. Classes that override or implement `AiClient`,
+`AiConversation`, `AiAgent`, `AiHttpClient` or `AiRequest` methods need the
+new `abortTrigger` parameter. Callers can observe several behaviour changes,
+listed below, so the minor version is bumped.
 
 ### Security
 
@@ -108,8 +109,22 @@ several behaviour changes, listed below, so the minor version is bumped.
 - **Anthropic sampling parameters:** `temperature` and `topP` are sent only
   to Claude 3.x and Claude 4 models up to 4.6, on API versions before
   `2026-10-21`. Other models (Claude Sonnet 5, Opus 4.7 and later, Haiku 5.5,
-  Fable and unknown model names) reject them, so they are omitted, and
-  `AiClient` logs a one-time warning per model through its `logger`.
+  Fable and unknown model names) reject them, so they are omitted. Claude 4.x
+  models accept only one of the two per request, so when both are set only
+  `temperature` is sent. `AiClient` logs a one-time warning per model
+  through its `logger` whenever a parameter is omitted.
+- **Anthropic default `max_tokens`:** 1024 → 16000 (4096 for Claude 3.x
+  models, whose output limits are lower). Claude 5 models think by default
+  and thinking counts toward `max_tokens`, so 1024 often cut answers short.
+  It is a cap, not a charge; set `maxTokens` to limit spend.
+- **Anthropic usage:** `inputTokens` now includes prompt-cache reads and
+  writes (`cache_read_input_tokens`, `cache_creation_input_tokens`), like
+  OpenAI's and Gemini's prompt counts, so it is the whole prompt.
+- **Provider names in exceptions:** errors raised by `AiClient` and
+  `AiAgent` (timeouts, unsupported capabilities, structured output, tool
+  limit) now use the same `provider` names as HTTP errors: `OpenAI`,
+  `Gemini`, `Anthropic`, `Custom` (was `OpenAiProvider`, ...). Other
+  providers still use their type name.
 - **Timeouts:** `AiClient.timeout` aborts the HTTP request of a timed-out
   `chat` attempt.
 - **Header validation:** header values with control or non-ASCII characters
@@ -122,11 +137,22 @@ several behaviour changes, listed below, so the minor version is bumped.
 
 ### New features
 
-- `AiRequest.abortTrigger`: completing this future aborts the HTTP request or
-  response stream, failing it with `AiTimeoutException`. It works as a
-  cancellation hook (set it from a middleware or when calling a provider
-  directly), is not retried, and is not part of the cache key.
-  `AiHttpClient.post`, `postStream` and `postSse` accept `abortTrigger`.
+- **Cancellation:** `abortTrigger` parameter on `AiClient.chat`, `stream`,
+  `streamText` and `generate`, `AiConversation.send` and `stream`, and
+  `AiAgent.run`. Completing the future aborts the HTTP request or response
+  stream and fails the call with `AiTimeoutException`; it is not retried, a
+  conversation's history is left unchanged, and an agent starts no further
+  tools. It reaches middleware and providers as `AiRequest.abortTrigger`
+  (not part of the cache key); `AiHttpClient.post`, `postStream` and
+  `postSse` accept it too.
+- `AiUsage.reasoningTokens` (OpenAI `reasoning_tokens`, Gemini
+  `thoughtsTokenCount`) and `AiUsage.cachedInputTokens` (OpenAI
+  `cached_tokens`, Gemini `cachedContentTokenCount`, Anthropic
+  `cache_read_input_tokens`), as parts of `outputTokens` and `inputTokens`.
+  `AiUsage.toString` lists all counts.
+- `AiPricing.cachedInputCostPerToken` and
+  `AiCostTracker.totalCachedInputTokens`: cached input is charged at its own
+  rate when one is set.
 - `AiProviderException.retryAfter`, parsed from `retry-after` /
   `retry-after-ms` on 5xx responses.
 - `capabilities` parameter on `CustomProvider` and `AiProvider.custom`
@@ -138,8 +164,15 @@ several behaviour changes, listed below, so the minor version is bumped.
   namespace automatically.
 - `AiKnowledgeBase.ingestBatch(batchSize:)` (default 100). Documents are
   stored only after every slice has been embedded.
-- `AnthropicProvider.thinkingMetadataKey`, `OpenAiProvider.defaultModel` and
-  `CustomProvider.defaultModel`.
+- `AnthropicProvider.thinkingMetadataKey`,
+  `AnthropicProvider.legacyDefaultMaxTokens`, `OpenAiProvider.defaultModel`
+  and `CustomProvider.defaultModel`.
+
+### Documentation
+
+- README snippets that did not compile (the provider-switching example
+  redeclared `ai`; the middleware example called an undefined function) are
+  fixed.
 
 ## 0.0.2
 

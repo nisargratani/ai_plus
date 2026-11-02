@@ -15,9 +15,7 @@ import '../models/ai_message.dart';
 import '../providers/anthropic/anthropic_provider.dart';
 import '../providers/anthropic/anthropic_sampling.dart';
 import '../providers/closeable_provider.dart';
-import '../providers/custom/custom_provider.dart';
-import '../providers/gemini/gemini_provider.dart';
-import '../providers/openai/openai_provider.dart';
+import '../providers/provider_name.dart';
 import '../retry/retry_policy.dart';
 import '../structured_output/schema.dart';
 import '../tools/ai_tool.dart';
@@ -92,7 +90,7 @@ class AiClient {
   late final List<AiMiddleware> _builtInMiddlewares = [
     if (logger case final logger?) LoggingMiddleware(logger),
     if (cache case final cache?)
-      CacheMiddleware(cache, namespace: _cacheNamespace),
+      CacheMiddleware(cache, namespace: providerNamespace(provider)),
     if (retryPolicy.maxAttempts > 0)
       RetryMiddleware(policy: retryPolicy, logger: logger),
   ];
@@ -101,21 +99,9 @@ class AiClient {
   List<AiMiddleware> get _allMiddlewares =>
       [...middlewares, ..._builtInMiddlewares];
 
-  String get _providerName => provider.runtimeType.toString();
+  String get _providerName => providerName(provider);
 
-  /// Separates cache entries of different providers and endpoints.
-  String get _cacheNamespace {
-    final Object provider = this.provider;
-    return switch (provider) {
-      OpenAiProvider(:final baseUrl) => 'OpenAI|$baseUrl',
-      GeminiProvider(:final baseUrl) => 'Gemini|$baseUrl',
-      AnthropicProvider(:final baseUrl) => 'Anthropic|$baseUrl',
-      CustomProvider(:final baseUrl) => 'Custom|$baseUrl',
-      _ => _providerName,
-    };
-  }
-
-  /// Models already warned about in [_warnIfSamplingOmitted].
+  /// Warnings already logged by [_warnIfSamplingOmitted].
   final Set<String> _samplingWarnings = {};
 
   /// Creates an [AiClient] with the given [provider] and optional configuration.
@@ -177,6 +163,10 @@ class AiClient {
   /// Throws [AiUnsupportedCapabilityException] when the provider doesn't support
   /// a requested feature (e.g. tools when toolCalling is false).
   ///
+  /// Completing [abortTrigger] cancels the call: the HTTP request is
+  /// aborted and the call fails with [AiTimeoutException] (and is not
+  /// retried). See [AiRequest.abortTrigger].
+  ///
   /// All errors, including validation errors, are delivered through the
   /// returned [Future].
   Future<AiResponse> chat({
@@ -188,6 +178,7 @@ class AiClient {
     List<String>? stop,
     List<AiTool>? tools,
     AiJsonSchema? schema,
+    Future<void>? abortTrigger,
   }) async {
     _checkToolSupport(tools);
 
@@ -207,6 +198,7 @@ class AiClient {
       stop: stop,
       tools: tools,
       schema: schema,
+      abortTrigger: abortTrigger,
     );
 
     // Build the middleware chain
@@ -227,7 +219,8 @@ class AiClient {
   /// tool calls, or usage information.
   ///
   /// Cancelling the subscription (e.g. breaking out of `await for`) aborts
-  /// the underlying HTTP request.
+  /// the underlying HTTP request. So does completing [abortTrigger], which
+  /// ends the stream with an [AiTimeoutException].
   ///
   /// ```dart
   /// await for (final chunk in ai.stream(messages: [...])) {
@@ -250,6 +243,7 @@ class AiClient {
     double? topP,
     List<String>? stop,
     List<AiTool>? tools,
+    Future<void>? abortTrigger,
   }) {
     try {
       if (!provider.capabilities.streaming) {
@@ -271,6 +265,7 @@ class AiClient {
       topP: topP,
       stop: stop,
       tools: tools,
+      abortTrigger: abortTrigger,
     );
 
     // Build the middleware chain
@@ -300,6 +295,7 @@ class AiClient {
     double? temperature,
     double? topP,
     List<String>? stop,
+    Future<void>? abortTrigger,
   }) {
     return stream(
       messages: messages,
@@ -308,6 +304,7 @@ class AiClient {
       temperature: temperature,
       topP: topP,
       stop: stop,
+      abortTrigger: abortTrigger,
     ).map((chunk) => chunk.text);
   }
 
@@ -326,6 +323,8 @@ class AiClient {
   /// );
   /// ```
   ///
+  /// [abortTrigger] cancels the call, as for [chat].
+  ///
   /// Throws [AiStructuredOutputException] if JSON extraction or decoding fails.
   Future<T> generate<T>({
     required String prompt,
@@ -334,6 +333,7 @@ class AiClient {
     String? model,
     int? maxTokens,
     double? temperature,
+    Future<void>? abortTrigger,
   }) async {
     final native = provider.capabilities.structuredOutput;
     final response = await chat(
@@ -350,6 +350,7 @@ class AiClient {
       maxTokens: maxTokens,
       temperature: temperature,
       schema: native ? schema : null,
+      abortTrigger: abortTrigger,
     );
 
     final text = response.text;
@@ -503,18 +504,31 @@ class AiClient {
     );
   }
 
-  /// Logs once per model when an Anthropic model will not receive the
-  /// request's `temperature`/`topP` (see `AnthropicProvider`).
+  /// Logs once per model (and case) when an Anthropic model will not
+  /// receive the request's `temperature`/`topP` (see `AnthropicProvider`).
   void _warnIfSamplingOmitted(AiRequest request) {
     final logger = this.logger;
     final Object provider = this.provider;
     if (logger == null || provider is! AnthropicProvider) return;
-    if (request.temperature == null && request.topP == null) return;
+    final temperature = request.temperature != null;
+    final topP = request.topP != null;
+    if (!temperature && !topP) return;
     final model = request.model ?? AnthropicProvider.defaultModel;
-    if (anthropicAcceptsSampling(model, provider.apiVersion)) return;
-    if (!_samplingWarnings.add(model)) return;
-    logger.warning('$model does not accept temperature/topP on Anthropic API '
-        'version ${provider.apiVersion}; they were omitted from the request. '
+    final sent = anthropicSamplingToSend(model, provider.apiVersion,
+        temperature: temperature, topP: topP);
+    final omitted = [
+      if (temperature && !sent.temperature) 'temperature',
+      if (topP && !sent.topP) 'topP',
+    ];
+    if (omitted.isEmpty) return;
+    // One warning per model and reason, whichever parameter triggered it.
+    if (!_samplingWarnings.add('$model|${sent.temperature}')) return;
+    final reason = sent.temperature
+        ? 'accepts only one of temperature/topP per request'
+        : 'does not accept sampling parameters on Anthropic API version '
+            '${provider.apiVersion}';
+    logger.warning('$model $reason; ${omitted.join(' and ')} '
+        '${omitted.length == 1 ? 'was' : 'were'} omitted from the request. '
         'This warning is shown once per model.');
   }
 

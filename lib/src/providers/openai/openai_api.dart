@@ -551,10 +551,15 @@ class OpenAiApi {
 
   static AiUsage? _parseUsage(Object? json) {
     if (json is! Map<String, dynamic>) return null;
+    final prompt = json['prompt_tokens_details'];
+    final completion = json['completion_tokens_details'];
     return AiUsage(
       inputTokens: json['prompt_tokens'] as int?,
       outputTokens: json['completion_tokens'] as int?,
       totalTokens: json['total_tokens'] as int?,
+      reasoningTokens:
+          completion is Map ? completion['reasoning_tokens'] as int? : null,
+      cachedInputTokens: prompt is Map ? prompt['cached_tokens'] as int? : null,
     );
   }
 

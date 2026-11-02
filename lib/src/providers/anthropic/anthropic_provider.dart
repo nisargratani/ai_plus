@@ -26,10 +26,11 @@ import 'anthropic_sampling.dart';
 /// final provider = AiProvider.anthropic(apiKey: 'sk-ant-...');
 /// ```
 ///
-/// Defaults to the `claude-sonnet-5` model and `max_tokens: 1024` (the
-/// Messages API requires an explicit output limit). `max_tokens` caps the
-/// whole output, thinking included: Claude 5 models think by default, so
-/// raise it for long or complex answers.
+/// Defaults to the `claude-sonnet-5` model and `max_tokens: 16000` (the
+/// Messages API requires an explicit output limit; Claude 3.x models get
+/// [legacyDefaultMaxTokens]). `max_tokens` caps the whole output, thinking
+/// included, and Claude 5 models think by default, so the default leaves
+/// room for both. Set `maxTokens` to cap spend more tightly.
 ///
 /// **Thinking:** when the model thinks before calling tools, its `thinking`
 /// and `redacted_thinking` blocks are stored verbatim in the metadata of the
@@ -40,8 +41,14 @@ import 'anthropic_sampling.dart';
 /// **Sampling parameters:** `temperature` and `topP` are sent only to models
 /// that accept them (Claude 3.x and Claude 4 up to 4.6, on API versions
 /// before `2026-10-21`). Newer models, including the default, reject them
-/// with HTTP 400, so they are omitted; `AiClient` logs a one-time warning
-/// when that happens.
+/// with HTTP 400, so they are omitted. Claude 4.x models accept only one of
+/// the two, so when both are set only `temperature` is sent. `AiClient`
+/// logs a one-time warning when a parameter is omitted.
+///
+/// **Usage:** [AiUsage.inputTokens] includes prompt-cache reads and writes
+/// (`cache_read_input_tokens`, `cache_creation_input_tokens`), like the
+/// other providers' prompt counts; [AiUsage.cachedInputTokens] holds the
+/// cache reads.
 class AnthropicProvider implements AiProvider, CloseableProvider {
   /// Creates an Anthropic provider.
   ///
@@ -66,8 +73,13 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
 
   /// The `max_tokens` used when a request does not specify one.
   ///
-  /// It includes thinking tokens.
-  static const defaultMaxTokens = 1024;
+  /// It includes thinking tokens. Every Claude 4.5 and later model accepts
+  /// at least 64K output tokens.
+  static const defaultMaxTokens = 16000;
+
+  /// The `max_tokens` used for Claude 3.x models when a request does not
+  /// specify one (Claude 3 Haiku allows at most 4096).
+  static const legacyDefaultMaxTokens = 4096;
 
   /// The [AiToolCallContent.metadata] key holding the `thinking` and
   /// `redacted_thinking` blocks of a tool-use turn, as a list of the raw
@@ -173,11 +185,21 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
         .join('\n');
 
     final model = request.model ?? defaultModel;
-    final sampling = anthropicAcceptsSampling(model, apiVersion);
+    final sampling = anthropicSamplingToSend(
+      model,
+      apiVersion,
+      temperature: request.temperature != null,
+      topP: request.topP != null,
+    );
 
     final body = <String, dynamic>{
       'model': model,
-      'max_tokens': request.maxTokens ?? defaultMaxTokens,
+      'max_tokens': request.maxTokens ??
+          anthropicDefaultMaxTokens(
+            model,
+            defaultMaxTokens: defaultMaxTokens,
+            legacyMaxTokens: legacyDefaultMaxTokens,
+          ),
       'messages': [
         for (final m in request.messages)
           if (m.role != AiMessageRole.system &&
@@ -185,9 +207,8 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
             _mapMessage(m),
       ],
       if (system.isNotEmpty) 'system': system,
-      if (sampling && request.temperature != null)
-        'temperature': request.temperature,
-      if (sampling && request.topP != null) 'top_p': request.topP,
+      if (sampling.temperature) 'temperature': request.temperature,
+      if (sampling.topP) 'top_p': request.topP,
       if (request.stop != null) 'stop_sequences': request.stop,
     };
 
@@ -338,12 +359,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
         ),
         finishReason:
             _parseFinishReason(json['stop_reason']) ?? AiFinishReason.unknown,
-        usage: usageJson != null
-            ? _usage(
-                usageJson['input_tokens'] as int?,
-                usageJson['output_tokens'] as int?,
-              )
-            : AiUsage.empty,
+        usage: usageJson != null ? _usage(usageJson) : AiUsage.empty,
         raw: json,
       );
     } catch (e) {
@@ -389,7 +405,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       case 'message_start':
         final message = json['message'] as Map<String, dynamic>?;
         final usage = message?['usage'] as Map<String, dynamic>?;
-        state.inputTokens = usage?['input_tokens'] as int?;
+        if (usage != null) state.usage.addAll(usage);
         return null;
 
       case 'content_block_start':
@@ -449,14 +465,16 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       case 'message_delta':
         final delta = json['delta'] as Map<String, dynamic>?;
         final usageJson = json['usage'] as Map<String, dynamic>?;
+        if (usageJson != null) {
+          // Cumulative counts; fields it leaves out (usually the input
+          // counts) keep their message_start values.
+          usageJson.forEach((key, value) {
+            if (value != null) state.usage[key] = value;
+          });
+        }
         return AiStreamChunk(
           finishReason: _parseFinishReason(delta?['stop_reason']),
-          usage: usageJson != null
-              ? _usage(
-                  (usageJson['input_tokens'] as int?) ?? state.inputTokens,
-                  usageJson['output_tokens'] as int?,
-                )
-              : null,
+          usage: usageJson != null ? _usage(state.usage) : null,
           raw: json,
         );
 
@@ -483,11 +501,23 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
     }
   }
 
-  static AiUsage _usage(int? input, int? output) => AiUsage(
-        inputTokens: input,
-        outputTokens: output,
-        totalTokens: (input ?? 0) + (output ?? 0),
-      );
+  /// Anthropic's `input_tokens` excludes prompt-cache reads and writes;
+  /// they are added so [AiUsage.inputTokens] is the whole prompt.
+  static AiUsage _usage(Map<String, dynamic> json) {
+    final uncached = json['input_tokens'] as int?;
+    final cacheWrite = json['cache_creation_input_tokens'] as int?;
+    final cacheRead = json['cache_read_input_tokens'] as int?;
+    final output = json['output_tokens'] as int?;
+    final input = uncached == null && cacheWrite == null && cacheRead == null
+        ? null
+        : (uncached ?? 0) + (cacheWrite ?? 0) + (cacheRead ?? 0);
+    return AiUsage(
+      inputTokens: input,
+      outputTokens: output,
+      totalTokens: (input ?? 0) + (output ?? 0),
+      cachedInputTokens: cacheRead,
+    );
+  }
 
   static AiFinishReason? _parseFinishReason(Object? reason) {
     switch (reason) {
@@ -510,7 +540,8 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
 }
 
 class _StreamState {
-  int? inputTokens;
+  /// Usage fields from message_start, updated by message_delta.
+  final Map<String, dynamic> usage = {};
   final Map<int, _ToolUseBuilder> toolCalls = {};
 
   /// Thinking blocks still being streamed, by content block index.

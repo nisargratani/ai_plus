@@ -1,9 +1,12 @@
 // ignore_for_file: prefer_initializing_formals
 
+import 'dart:async';
+
 import '../core/ai_client.dart';
 import '../errors/ai_exception.dart';
 import '../models/ai_content.dart';
 import '../models/ai_message.dart';
+import '../providers/provider_name.dart';
 import '../tools/ai_tool.dart';
 import '../tools/tool_executor.dart';
 
@@ -69,10 +72,26 @@ class AiAgent {
   /// than thrown. Errors from the client (network, authentication, ...)
   /// propagate unchanged.
   ///
+  /// Completing [abortTrigger] cancels the run: the model call in flight is
+  /// aborted, no further tools are started, and the run fails with
+  /// [AiTimeoutException]. Tools that are already running finish.
+  ///
   /// Throws [AiToolException] if the model still requests tools after
   /// [maxIterations] tool rounds. Those last tool calls are not executed, so
   /// no tool side effect happens without its result reaching the model.
-  Future<String> run(String prompt) async {
+  Future<String> run(String prompt, {Future<void>? abortTrigger}) async {
+    var aborted = false;
+    if (abortTrigger != null) {
+      unawaited(abortTrigger.then((_) => aborted = true,
+          onError: (Object _) => aborted = true));
+    }
+    void checkAborted() {
+      if (aborted) {
+        throw AiTimeoutException('Agent run aborted',
+            provider: providerName(_client.provider));
+      }
+    }
+
     final messages = <AiMessage>[];
 
     // Add system instructions if provided
@@ -85,12 +104,14 @@ class AiAgent {
 
     for (var round = 0;; round++) {
       // 1. Ask the model
+      checkAborted();
       final response = await _client.chat(
         // A snapshot, so middleware holding on to the request does not see
         // later turns appended to it.
         messages: List.unmodifiable(messages),
         model: _model,
         tools: _tools,
+        abortTrigger: abortTrigger,
       );
 
       final message = response.message;
@@ -106,15 +127,18 @@ class AiAgent {
       // 3. Stop before running tools whose results could not be sent back.
       if (round >= maxIterations) {
         final names = {for (final c in toolCalls) c.name}.join(', ');
+        String plural(String word) => maxIterations == 1 ? word : '${word}s';
         throw AiToolException(
-          'Agent failed to complete task within $maxIterations iterations: '
-          'after $maxIterations tool rounds the model requested more tool '
-          'calls ($names), which were not executed.',
-          provider: _client.provider.runtimeType.toString(),
+          'Agent failed to complete task within $maxIterations '
+          '${plural('iteration')}: after $maxIterations tool '
+          '${plural('round')} the model requested more tool calls ($names), '
+          'which were not executed.',
+          provider: providerName(_client.provider),
         );
       }
 
-      // 4. Execute the tools concurrently
+      // 4. Execute the tools concurrently (unless the run was cancelled)
+      checkAborted();
       final results = await _executor.executeAll(toolCalls);
 
       // 5. Feed the results back into the conversation

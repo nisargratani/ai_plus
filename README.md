@@ -60,11 +60,11 @@ Future<void> main() async {
 Switch providers by changing one line:
 
 ```dart
-final ai = AiClient(provider: AiProvider.gemini(apiKey: geminiKey));
-final ai = AiClient(provider: AiProvider.anthropic(apiKey: anthropicKey));
+final gemini = AiClient(provider: AiProvider.gemini(apiKey: geminiKey));
+final claude = AiClient(provider: AiProvider.anthropic(apiKey: anthropicKey));
 
 // Local Ollama (no key needed). Describe what the model supports:
-final ai = AiClient(
+final ollama = AiClient(
   provider: AiProvider.custom(
     baseUrl: 'http://localhost:11434/v1',
     apiKey: '',
@@ -74,7 +74,7 @@ final ai = AiClient(
 );
 
 // Azure OpenAI (key in an `api-key` header)
-final ai = AiClient(
+final azure = AiClient(
   provider: AiProvider.custom(
     baseUrl: 'https://my-resource.openai.azure.com/openai/v1',
     apiKey: '',
@@ -109,7 +109,7 @@ upgrades never change it:
 |----------|------|------------|
 | OpenAI | `gpt-6-luna` | `text-embedding-3-small` |
 | Gemini | `gemini-flash-latest` | `gemini-embedding-001` |
-| Anthropic | `claude-sonnet-5` (`max_tokens` 1024, thinking included) | — |
+| Anthropic | `claude-sonnet-5` (`max_tokens` 16000, thinking included; 4096 for Claude 3.x) | — |
 | Custom | `gpt-6-luna` (always set a model) | `text-embedding-3-small` |
 
 Provider notes:
@@ -120,13 +120,16 @@ Provider notes:
 - **Anthropic thinking:** Claude 5 models think by default. When the model
   thinks before calling a tool, its `thinking` blocks are kept in
   `AiToolCallContent.metadata` and sent back unchanged with the tool results,
-  as the API requires. `max_tokens` covers thinking and answer together, so
-  raise `maxTokens` for long answers.
+  as the API requires. `max_tokens` covers thinking and answer together;
+  the default of 16000 leaves room for both, and you can lower `maxTokens`
+  to cap spend.
 - **Anthropic sampling:** Claude Sonnet 5, Opus 4.7 and later, Haiku 5.5 and
   Fable reject `temperature` and `top_p` (HTTP 400), as does every model on
   API version `2026-10-21` or later. For those models `AnthropicProvider`
   omits `temperature`/`topP`, and `AiClient` logs a one-time warning per
-  model through its `logger`. Older models still receive them.
+  model through its `logger`. Older models still receive them, except that
+  Claude 4.x accepts only one of the two per request: when both are set,
+  only `temperature` is sent.
 
 Every factory accepts optional `headers` (sent with every request) and
 `httpClient`. The concrete classes (`OpenAiProvider`, `GeminiProvider`,
@@ -333,26 +336,30 @@ final ai = AiClient(
 - **Logging:** only metadata and latency are logged, never message content
   or API keys.
 
-**Cancelling a request:** `AiRequest.abortTrigger` aborts the HTTP request
-(or the response stream) when the future completes, and the call fails with
-`AiTimeoutException`. Requests whose trigger has fired are not retried. Set it
-from a middleware, or pass it when calling a provider directly:
+**Cancelling a request:** pass an `abortTrigger` to `chat`, `stream`,
+`generate`, `conversation.send`/`stream` or `agent.run`. When the future
+completes, the HTTP request (or response stream) is aborted and the call
+fails with `AiTimeoutException`; it is not retried, and an agent starts no
+further tools.
 
 ```dart
 final cancel = Completer<void>();
-final reply = provider.chat(AiRequest(messages: messages, abortTrigger: cancel.future));
+final reply = ai.chat(messages: messages, abortTrigger: cancel.future);
 // Later, for example when the user leaves the screen:
 cancel.complete();
 ```
 
+Breaking out of `await for` cancels a stream as well. Middleware sees the
+trigger as `AiRequest.abortTrigger`.
+
 Custom middleware extends `AiMiddleware` and overrides what it needs:
 
 ```dart
-class AuditMiddleware extends AiMiddleware {
+class UsageMiddleware extends AiMiddleware {
   @override
   Future<AiResponse> handleChat(AiRequest request, AiRequestHandler next) async {
     final response = await next(request);
-    audit(request.model, response.usage);
+    print('${request.model ?? 'default model'}: ${response.usage.totalTokens} tokens');
     return response;
   }
 }
@@ -378,6 +385,7 @@ final tracker = AiCostTracker(
   pricing: const AiPricing(
     inputCostPerToken: 0.0000025, // $2.50 per 1M tokens
     outputCostPerToken: 0.00001, // $10 per 1M tokens
+    cachedInputCostPerToken: 0.00000025, // optional: prompt-cache reads
   ),
 );
 
@@ -385,8 +393,11 @@ tracker.addUsage(response.usage);
 print('Total cost: \$${tracker.estimatedCost.toStringAsFixed(4)}');
 ```
 
-Gemini's `outputTokens` include thinking tokens, which Gemini bills as
-output, so `inputTokens + outputTokens` matches `totalTokens`.
+`AiUsage` is normalised across providers. `inputTokens` is the whole prompt,
+including tokens served from the provider's prompt cache (also reported as
+`cachedInputTokens`). `outputTokens` includes reasoning/thinking tokens,
+which providers bill as output (also reported as `reasoningTokens` where the
+provider gives them). So `inputTokens + outputTokens` matches `totalTokens`.
 
 ### Conversation storage
 
@@ -511,7 +522,11 @@ The full list is in the [changelog](CHANGELOG.md):
 - `AiAgent` makes one final model call after `maxIterations` tool rounds, and
   never runs tools it cannot report back.
 - Cache keys changed (prefix `ai_plus:v2:`), so persistent caches start cold.
-- Anthropic omits `temperature`/`topP` for models that reject them.
+- Anthropic omits `temperature`/`topP` for models that reject them (and
+  `topP` when both are set on Claude 4.x), its default `max_tokens` is 16000
+  (4096 for Claude 3.x), and its `inputTokens` include prompt-cache tokens.
+- Exceptions raised by `AiClient` name built-in providers `OpenAI`,
+  `Gemini`, `Anthropic` or `Custom`, like HTTP errors do.
 - `http` 1.6.0 or later is required.
 
 ## Migrating from 0.0.1

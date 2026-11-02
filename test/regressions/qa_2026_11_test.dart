@@ -418,11 +418,21 @@ void main() {
     });
 
     test('are kept for older models that accept them', () async {
-      for (final model in ['claude-sonnet-4-5', 'claude-3-5-haiku-20241022']) {
+      final body = await sentBody(model: 'claude-3-5-haiku-20241022');
+      expect(body['temperature'], 0.2);
+      expect(body['top_p'], 0.9);
+    });
+
+    test('Claude 4.x gets only temperature when both are set', () async {
+      for (final model in ['claude-sonnet-4-5', 'claude-opus-4-1']) {
         final body = await sentBody(model: model);
         expect(body['temperature'], 0.2, reason: model);
-        expect(body['top_p'], 0.9, reason: model);
+        expect(body.containsKey('top_p'), isFalse, reason: model);
       }
+      expect(
+          anthropicSamplingToSend('claude-sonnet-4-5', '2023-06-01',
+              temperature: false, topP: true),
+          (temperature: false, topP: true));
     });
 
     test('are omitted on API version 2026-10-21 for every model', () async {
@@ -489,6 +499,16 @@ void main() {
       await ai.chat(
           messages: [_user], temperature: 0.2, model: 'claude-sonnet-4-5');
       expect(warnings(), hasLength(2));
+      // Claude 4.x with both parameters: topP is dropped, warned once.
+      for (var i = 0; i < 2; i++) {
+        await ai.chat(
+            messages: [_user],
+            temperature: 0.2,
+            topP: 0.9,
+            model: 'claude-sonnet-4-5');
+      }
+      expect(warnings(), hasLength(3));
+      expect(warnings().last, contains('only one of temperature/topP'));
     });
   });
 
@@ -795,7 +815,7 @@ void main() {
           maxIterations: 1);
       final error = await _errorOf(agent.run('Refund A1001'));
       expect(error, isA<AiToolException>());
-      expect((error as AiToolException).message, contains('1 iterations'));
+      expect((error as AiToolException).message, contains('1 iteration:'));
       expect(error.message, contains('refund'));
       expect(executed, hasLength(1), reason: 'only the reported round ran');
       expect(provider.requests, hasLength(2));
@@ -1215,6 +1235,299 @@ void main() {
               .ingestBatch(contents: [for (var i = 0; i < 150; i++) 'doc $i'])),
           isA<AiInvalidRequestException>());
       expect(store.documents, isEmpty);
+    });
+  });
+
+  // ── Follow-up decisions for 0.1.0 ─────────────────────────────────────
+
+  group('abortTrigger on the client API', () {
+    late _HangingServer server;
+    setUp(() async => server = await _HangingServer.start());
+    tearDown(() => server.close());
+
+    AiClient hanging() {
+      final ai = AiClient(
+        provider: AiProvider.openAI(apiKey: 'k', baseUrl: server.baseUrl),
+        retryPolicy: AiRetryPolicy.none,
+      );
+      addTearDown(ai.close);
+      return ai;
+    }
+
+    test('chat(abortTrigger:) aborts the request', () async {
+      final error = await _errorOf(hanging().chat(
+        messages: [_user],
+        abortTrigger: Future<void>.delayed(const Duration(milliseconds: 100)),
+      ));
+      expect(error, isA<AiTimeoutException>());
+      await server.waitUntilClosed(1);
+    });
+
+    test('conversation.send(abortTrigger:) leaves the history unchanged',
+        () async {
+      final conversation = hanging().conversation();
+      final error = await _errorOf(conversation.send(
+        'hi',
+        abortTrigger: Future<void>.delayed(const Duration(milliseconds: 100)),
+      ));
+      expect(error, isA<AiTimeoutException>());
+      expect(conversation.messages, isEmpty);
+      await server.waitUntilClosed(1);
+    });
+
+    test('stream, streamText, generate and conversation.stream pass it on',
+        () async {
+      final provider = FakeProvider(
+        onChat: (_) => textResponse('{"a": 1}'),
+        onStream: (_) => Stream.value(const AiStreamChunk(
+            content: [AiTextContent('x')], finishReason: AiFinishReason.stop)),
+      );
+      final ai = AiClient(provider: provider);
+      final trigger = Completer<void>().future;
+
+      await ai.stream(messages: [_user], abortTrigger: trigger).drain<void>();
+      await ai
+          .streamText(messages: [_user], abortTrigger: trigger).drain<void>();
+      await ai.generate(
+        prompt: 'x',
+        schema: AiJsonSchema.object(properties: {}),
+        decoder: (j) => j,
+        abortTrigger: trigger,
+      );
+      await ai.conversation().stream('x', abortTrigger: trigger).drain<void>();
+
+      expect(provider.requests, hasLength(4));
+      for (final r in provider.requests) {
+        expect(r.abortTrigger, same(trigger));
+      }
+    });
+
+    test('agent.run(abortTrigger:) starts no further tools or calls', () async {
+      final cancel = Completer<void>();
+      var executed = 0;
+      final provider = FakeProvider(
+        onChat: (_) => const AiResponse(
+          message: AiMessage(role: AiMessageRole.assistant, content: [
+            AiToolCallContent(id: 'c', name: 'work', arguments: {}),
+          ]),
+        ),
+      );
+      final tool = AiTool(
+        name: 'work',
+        description: 'd',
+        parameters: AiJsonSchema.object(properties: {}),
+        execute: (_) async {
+          executed++;
+          cancel.complete(); // e.g. the user pressed stop meanwhile
+          return 'done';
+        },
+      );
+      final agent =
+          AiAgent(client: AiClient(provider: provider), tools: [tool]);
+
+      final error =
+          await _errorOf(agent.run('go', abortTrigger: cancel.future));
+      expect(error, isA<AiTimeoutException>());
+      expect(executed, 1);
+      expect(provider.requests, hasLength(1));
+      expect(provider.requests.single.abortTrigger, same(cancel.future));
+    });
+  });
+
+  group('AiUsage reasoning and cached tokens', () {
+    test('OpenAI', () async {
+      final provider = OpenAiProvider(
+        apiKey: 'k',
+        httpClient: AiHttpClient(
+          client: MockClient((_) async => _json({
+                ..._openAiCompletion(content: 'ok'),
+                'usage': {
+                  'prompt_tokens': 100,
+                  'completion_tokens': 50,
+                  'total_tokens': 150,
+                  'prompt_tokens_details': {'cached_tokens': 64},
+                  'completion_tokens_details': {'reasoning_tokens': 30},
+                },
+              })),
+        ),
+      );
+      final usage = (await provider.chat(userRequest('x'))).usage;
+      expect(usage.inputTokens, 100);
+      expect(usage.cachedInputTokens, 64);
+      expect(usage.outputTokens, 50);
+      expect(usage.reasoningTokens, 30);
+    });
+
+    test('Gemini', () async {
+      final provider = GeminiProvider(
+        apiKey: 'k',
+        httpClient: AiHttpClient(
+          client: MockClient((_) async => _json(_geminiResponse('ok', usage: {
+                'promptTokenCount': 100,
+                'cachedContentTokenCount': 80,
+                'candidatesTokenCount': 5,
+                'thoughtsTokenCount': 20,
+                'totalTokenCount': 125,
+              }))),
+        ),
+      );
+      final usage = (await provider.chat(userRequest('x'))).usage;
+      expect(usage.inputTokens, 100);
+      expect(usage.cachedInputTokens, 80);
+      expect(usage.outputTokens, 25);
+      expect(usage.reasoningTokens, 20);
+    });
+
+    const anthropicUsage = {
+      'input_tokens': 10,
+      'cache_creation_input_tokens': 5,
+      'cache_read_input_tokens': 100,
+      'output_tokens': 7,
+    };
+
+    test('Anthropic counts cache reads and writes as input', () async {
+      final provider = AnthropicProvider(
+        apiKey: 'k',
+        httpClient: AiHttpClient(
+          client: MockClient((_) async => _json({
+                ..._anthropicMessage([
+                  {'type': 'text', 'text': 'ok'},
+                ]),
+                'usage': anthropicUsage,
+              })),
+        ),
+      );
+      final usage = (await provider.chat(userRequest('x'))).usage;
+      expect(usage.inputTokens, 115);
+      expect(usage.cachedInputTokens, 100);
+      expect(usage.outputTokens, 7);
+      expect(usage.totalTokens, 122);
+    });
+
+    test('Anthropic streams keep message_start input counts', () async {
+      final provider = AnthropicProvider(
+        apiKey: 'k',
+        httpClient: AiHttpClient(
+          client: MockClient.streaming((_, __) async => sseResponse([
+                {
+                  'type': 'message_start',
+                  'message': {
+                    'usage': {...anthropicUsage, 'output_tokens': 1},
+                  },
+                },
+                {
+                  'type': 'message_delta',
+                  'delta': {'stop_reason': 'end_turn'},
+                  'usage': {'output_tokens': 7, 'input_tokens': null},
+                },
+                {'type': 'message_stop'},
+              ])),
+        ),
+      );
+      final chunks = await provider.stream(userRequest('x')).toList();
+      final usage = chunks.last.usage!;
+      expect(usage.inputTokens, 115);
+      expect(usage.cachedInputTokens, 100);
+      expect(usage.outputTokens, 7);
+    });
+
+    test('AiCostTracker charges cached input at its own rate', () {
+      const usage =
+          AiUsage(inputTokens: 100, cachedInputTokens: 40, outputTokens: 10);
+      final discounted = AiCostTracker(
+        pricing: const AiPricing(
+          inputCostPerToken: 1,
+          cachedInputCostPerToken: 0.1,
+          outputCostPerToken: 2,
+        ),
+      )..addUsage(usage);
+      expect(discounted.estimatedCost, closeTo(60 + 4 + 20, 1e-9));
+      expect(discounted.totalCachedInputTokens, 40);
+
+      final flat = AiCostTracker(
+          pricing: const AiPricing(inputCostPerToken: 1, outputCostPerToken: 2))
+        ..addUsage(usage);
+      expect(flat.estimatedCost, 120);
+      expect((flat..reset()).totalCachedInputTokens, 0);
+    });
+  });
+
+  group('Anthropic default max_tokens', () {
+    Future<Object?> sentMaxTokens({String? model, int? maxTokens}) async {
+      late Map<String, dynamic> body;
+      final provider = AnthropicProvider(
+        apiKey: 'k',
+        httpClient: AiHttpClient(
+          client: MockClient((req) async {
+            body = jsonDecode(req.body) as Map<String, dynamic>;
+            return _json(_anthropicMessage([
+              {'type': 'text', 'text': 'ok'},
+            ]));
+          }),
+        ),
+      );
+      await provider.chat(
+          AiRequest(messages: [_user], model: model, maxTokens: maxTokens));
+      return body['max_tokens'];
+    }
+
+    test('leaves room for thinking, and fits Claude 3.x limits', () async {
+      expect(AnthropicProvider.defaultMaxTokens, 16000);
+      expect(await sentMaxTokens(), 16000);
+      expect(await sentMaxTokens(model: 'claude-haiku-4-5'), 16000);
+      expect(await sentMaxTokens(model: 'claude-3-haiku-20240307'), 4096);
+      expect(await sentMaxTokens(model: 'claude-3-5-sonnet-latest'), 4096);
+      expect(await sentMaxTokens(maxTokens: 300), 300);
+    });
+  });
+
+  group('provider names in exceptions', () {
+    test('client-side errors use the same short names as HTTP errors',
+        () async {
+      final custom = AiClient(
+        provider: AiProvider.custom(
+            baseUrl: 'http://x/v1',
+            apiKey: '',
+            capabilities: const AiCapabilities()),
+      );
+      final error = await _errorOf(custom.stream(messages: [_user]).toList());
+      expect((error as AiException).provider, 'Custom');
+
+      final timeout = AiClient(
+        provider: AiProvider.openAI(
+          apiKey: 'k',
+          httpClient: AiHttpClient(
+            client: MockClient((_) => Completer<http.Response>().future),
+          ),
+        ),
+        timeout: const Duration(milliseconds: 50),
+        retryPolicy: AiRetryPolicy.none,
+      );
+      final timedOut = await _errorOf(timeout.chat(messages: [_user]));
+      expect((timedOut as AiTimeoutException).provider, 'OpenAI');
+    });
+
+    test('other providers use their type name', () async {
+      final ai = AiClient(
+          provider: FakeProvider(capabilities: const AiCapabilities()));
+      final error =
+          await _errorOf(ai.chat(messages: [_user], tools: [_weatherTool()]));
+      expect(error, isA<AiUnsupportedCapabilityException>());
+      expect((error as AiException).provider, 'FakeProvider');
+      final agentError = await _errorOf(AiAgent(
+        client: AiClient(
+          provider: FakeProvider(
+            onChat: (_) => const AiResponse(
+              message: AiMessage(role: AiMessageRole.assistant, content: [
+                AiToolCallContent(id: 'c', name: 'get_weather', arguments: {}),
+              ]),
+            ),
+          ),
+        ),
+        tools: [_weatherTool()],
+        maxIterations: 0,
+      ).run('x'));
+      expect((agentError as AiToolException).provider, 'FakeProvider');
     });
   });
 }
