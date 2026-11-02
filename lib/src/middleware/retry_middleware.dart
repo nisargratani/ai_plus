@@ -1,11 +1,10 @@
-import 'dart:async';
-
 import '../core/ai_request.dart';
 import '../core/ai_response.dart';
 import '../core/ai_stream.dart';
 import '../errors/ai_exception.dart';
 import '../logging/ai_logger.dart';
 import '../retry/retry_policy.dart';
+import '../utils/abort_trigger.dart';
 import 'ai_middleware.dart';
 
 /// Middleware that handles retrying requests based on an [AiRetryPolicy].
@@ -35,7 +34,7 @@ class RetryMiddleware implements AiMiddleware {
   @override
   Future<AiResponse> handleChat(
       AiRequest request, AiRequestHandler next) async {
-    final aborted = _watchAbort(request);
+    final aborted = watchAbortTrigger(request.abortTrigger);
     var attempt = 0;
     while (true) {
       try {
@@ -52,7 +51,7 @@ class RetryMiddleware implements AiMiddleware {
   @override
   Stream<AiStreamChunk> handleStream(
       AiRequest request, AiStreamHandler next) async* {
-    final aborted = _watchAbort(request);
+    final aborted = watchAbortTrigger(request.abortTrigger);
     var attempt = 0;
     while (true) {
       var emitted = false;
@@ -72,18 +71,6 @@ class RetryMiddleware implements AiMiddleware {
         await _backoff(e, attempt++, 'Stream request');
       }
     }
-  }
-
-  /// Returns a function telling whether [request]'s abort trigger fired.
-  static bool Function() _watchAbort(AiRequest request) {
-    final trigger = request.abortTrigger;
-    if (trigger == null) return () => false;
-    var fired = false;
-    void markFired() => fired = true;
-    unawaited(trigger.then((_) => markFired(), onError: (Object _) {
-      markFired();
-    }));
-    return () => fired;
   }
 
   Future<void> _backoff(Object error, int attempt, String what) {

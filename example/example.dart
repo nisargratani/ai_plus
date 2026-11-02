@@ -5,7 +5,9 @@
 //
 // Swap the provider (see step 1) to run the same code against Gemini,
 // Claude or a local Ollama server.
+import 'dart:async';
 import 'dart:io';
+
 import 'package:ai_plus/ai_plus.dart';
 
 Future<void> main() async {
@@ -41,7 +43,12 @@ Future<void> main() async {
   // You can switch providers without changing any code below:
   // provider: AiProvider.gemini(apiKey: geminiKey),
   // provider: AiProvider.anthropic(apiKey: claudeKey),
-  // provider: AiProvider.custom(baseUrl: 'http://localhost:11434/v1', apiKey: ''),
+  // provider: AiProvider.custom(
+  //   baseUrl: 'http://localhost:11434/v1',
+  //   apiKey: '',
+  //   // Describe what the local model supports:
+  //   capabilities: const AiCapabilities(streaming: true, toolCalling: true),
+  // ),
 
   try {
     await _tour(ai, metrics, costTracker);
@@ -68,7 +75,8 @@ Future<void> _tour(
     ],
   );
   print('Response: ${response.text}');
-  print('Tokens: ${response.usage.totalTokens}');
+  // Input includes cached prompt tokens; output includes reasoning tokens.
+  print('Usage: ${response.usage}');
   costTracker.addUsage(response.usage);
 
   // ──────────────────────────────────────────────────────────────────────
@@ -81,6 +89,25 @@ Future<void> _tour(
     stdout.write(text);
   }
   print('');
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 3b. CANCELLATION
+  // ──────────────────────────────────────────────────────────────────────
+
+  print('\n═══ Cancellation ═══');
+  // Complete the trigger to cancel, e.g. when the user taps "Stop". The
+  // HTTP request is aborted, so the provider stops generating it.
+  final stop = Completer<void>();
+  Timer(const Duration(milliseconds: 300), stop.complete);
+  try {
+    final essay = await ai.chat(
+      messages: [AiMessage.user('Write a 2000-word essay about the sea.')],
+      abortTrigger: stop.future,
+    );
+    print('Finished before the stop: ${essay.text.length} characters');
+  } on AiTimeoutException catch (e) {
+    print('Cancelled: ${e.message}');
+  }
 
   // ──────────────────────────────────────────────────────────────────────
   // 4. CONVERSATIONS (Multi-Turn)

@@ -4,6 +4,8 @@ import '../embeddings/embedding.dart';
 import '../embeddings/embedding_service.dart';
 import '../errors/ai_exception.dart';
 import '../models/ai_message.dart';
+import '../providers/provider_name.dart';
+import '../utils/abort_trigger.dart';
 import 'vector_store.dart';
 
 /// A high-level helper for Retrieval-Augmented Generation (RAG).
@@ -76,6 +78,10 @@ class AiKnowledgeBase {
   /// documents. The documents are added to the store only after every slice
   /// has been embedded, so a failed request stores none of them.
   ///
+  /// Completing [abortTrigger] cancels the ingestion: no further slice is
+  /// sent (a slice already in flight finishes), nothing is stored, and an
+  /// [AiTimeoutException] is thrown.
+  ///
   /// When given, [ids] and [metadataList] must have the same length as
   /// [contents], and [batchSize] must be positive; otherwise an
   /// [ArgumentError] is thrown before any request is made. Documents without
@@ -85,6 +91,7 @@ class AiKnowledgeBase {
     List<String>? ids,
     List<Map<String, dynamic>>? metadataList,
     int batchSize = 100,
+    Future<void>? abortTrigger,
   }) async {
     if (batchSize <= 0) {
       throw ArgumentError.value(batchSize, 'batchSize', 'must be positive');
@@ -99,8 +106,21 @@ class AiKnowledgeBase {
     }
     if (contents.isEmpty) return;
 
+    final aborted = watchAbortTrigger(abortTrigger);
+    void checkAborted() {
+      if (aborted()) {
+        throw AiTimeoutException(
+          'Ingestion aborted; no documents were stored',
+          provider: providerName(_client.provider),
+        );
+      }
+    }
+
     final embeddings = <AiEmbedding>[];
     for (var start = 0; start < contents.length; start += batchSize) {
+      // A yield, so a trigger completed before this call is observed.
+      await Future<void>.delayed(Duration.zero);
+      checkAborted();
       final end = start + batchSize < contents.length
           ? start + batchSize
           : contents.length;
@@ -115,6 +135,7 @@ class AiKnowledgeBase {
       }
       embeddings.addAll(result.embeddings);
     }
+    checkAborted();
 
     final prefix = DateTime.now().microsecondsSinceEpoch;
     await _store.addAll([
@@ -148,6 +169,11 @@ class AiKnowledgeBase {
   /// A custom [systemPrompt] replaces the default instructions; the
   /// retrieved context is always appended to it.
   ///
+  /// Completing [abortTrigger] cancels the call with an
+  /// [AiTimeoutException]: the answer request is aborted, or not started if
+  /// the trigger fires during the search (whose embeddings request runs to
+  /// completion).
+  ///
   /// ```dart
   /// final answer = await kb.ask('What is Flutter?');
   /// print(answer.text);
@@ -157,8 +183,14 @@ class AiKnowledgeBase {
     int k = 4,
     String? model,
     String? systemPrompt,
+    Future<void>? abortTrigger,
   }) async {
+    final aborted = watchAbortTrigger(abortTrigger);
     final results = await search(question, k: k);
+    if (aborted()) {
+      throw AiTimeoutException('Request aborted',
+          provider: providerName(_client.provider));
+    }
 
     final context = results.map((r) => r.document.content).join('\n\n---\n\n');
 
@@ -172,6 +204,7 @@ class AiKnowledgeBase {
         AiMessage.user(question),
       ],
       model: model,
+      abortTrigger: abortTrigger,
     );
   }
 
