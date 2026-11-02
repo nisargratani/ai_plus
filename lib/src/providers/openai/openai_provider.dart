@@ -17,8 +17,10 @@ import 'openai_api.dart';
 /// final provider = AiProvider.openAI(apiKey: 'sk-...');
 /// ```
 ///
-/// Defaults to the `gpt-4o-mini` model and `text-embedding-3-small`
-/// embeddings when no model is specified.
+/// Defaults to the [defaultModel] (`gpt-6-luna`) and `text-embedding-3-small`
+/// embeddings when no model is specified. `gpt-6-luna` supports function
+/// calling in Chat Completions only with `reasoning_effort: "none"`, so that
+/// is sent automatically with tools for `gpt-6-luna` models.
 class OpenAiProvider implements AiProvider, CloseableProvider {
   /// Creates an OpenAI provider.
   ///
@@ -37,9 +39,13 @@ class OpenAiProvider implements AiProvider, CloseableProvider {
           baseUrl: baseUrl,
           headers: headers,
           providerName: 'OpenAI',
-          defaultModel: 'gpt-4o-mini',
+          defaultModel: defaultModel,
+          openAiModelRules: true,
           httpClient: httpClient,
         );
+
+  /// The model used when a request does not specify one.
+  static const defaultModel = 'gpt-6-luna';
 
   /// The API key for authentication.
   final String apiKey;

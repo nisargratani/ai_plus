@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import '../cache/ai_cache.dart';
@@ -9,8 +10,14 @@ import '../middleware/ai_middleware.dart';
 import '../middleware/cache_middleware.dart';
 import '../middleware/logging_middleware.dart';
 import '../middleware/retry_middleware.dart';
+import '../models/ai_finish_reason.dart';
 import '../models/ai_message.dart';
+import '../providers/anthropic/anthropic_provider.dart';
+import '../providers/anthropic/anthropic_sampling.dart';
 import '../providers/closeable_provider.dart';
+import '../providers/custom/custom_provider.dart';
+import '../providers/gemini/gemini_provider.dart';
+import '../providers/openai/openai_provider.dart';
 import '../retry/retry_policy.dart';
 import '../structured_output/schema.dart';
 import '../tools/ai_tool.dart';
@@ -47,9 +54,11 @@ class AiClient {
   /// The maximum duration to wait for a request before throwing an
   /// [AiTimeoutException].
   ///
-  /// For [chat] this bounds each attempt; for [stream] it bounds the gap
-  /// between consecutive chunks (an idle timeout), so long streams that keep
-  /// producing output are not cut off.
+  /// For [chat] this bounds each attempt, and an attempt that times out is
+  /// aborted (through [AiRequest.abortTrigger]), so the provider stops
+  /// generating it. For [stream] it bounds the gap between consecutive
+  /// chunks (an idle timeout), so long streams that keep producing output
+  /// are not cut off; a stream that times out is cancelled.
   final Duration? timeout;
 
   /// The retry policy. Defaults to exponential backoff with up to 3 retries.
@@ -58,9 +67,16 @@ class AiClient {
   final AiRetryPolicy retryPolicy;
 
   /// The logger used for debugging and info.
+  ///
+  /// Besides the request log lines, it receives one-time warnings, for
+  /// example when an Anthropic model does not accept `temperature`/`topP`
+  /// and they are omitted.
   final AiLogger? logger;
 
   /// The cache used to store and retrieve identical requests.
+  ///
+  /// Keys include the provider and its endpoint, so one cache can be shared
+  /// by several clients.
   final AiCache? cache;
 
   /// Custom middleware to be executed before built-in middlewares.
@@ -75,7 +91,8 @@ class AiClient {
   /// Built-in middleware derived from the constructor arguments.
   late final List<AiMiddleware> _builtInMiddlewares = [
     if (logger case final logger?) LoggingMiddleware(logger),
-    if (cache case final cache?) CacheMiddleware(cache),
+    if (cache case final cache?)
+      CacheMiddleware(cache, namespace: _cacheNamespace),
     if (retryPolicy.maxAttempts > 0)
       RetryMiddleware(policy: retryPolicy, logger: logger),
   ];
@@ -85,6 +102,21 @@ class AiClient {
       [...middlewares, ..._builtInMiddlewares];
 
   String get _providerName => provider.runtimeType.toString();
+
+  /// Separates cache entries of different providers and endpoints.
+  String get _cacheNamespace {
+    final Object provider = this.provider;
+    return switch (provider) {
+      OpenAiProvider(:final baseUrl) => 'OpenAI|$baseUrl',
+      GeminiProvider(:final baseUrl) => 'Gemini|$baseUrl',
+      AnthropicProvider(:final baseUrl) => 'Anthropic|$baseUrl',
+      CustomProvider(:final baseUrl) => 'Custom|$baseUrl',
+      _ => _providerName,
+    };
+  }
+
+  /// Models already warned about in [_warnIfSamplingOmitted].
+  final Set<String> _samplingWarnings = {};
 
   /// Creates an [AiClient] with the given [provider] and optional configuration.
   ///
@@ -322,29 +354,24 @@ class AiClient {
 
     final text = response.text;
 
-    // Find JSON block if present
-    final jsonStart = text.indexOf('{');
-    final jsonEnd = text.lastIndexOf('}');
-
-    if (jsonStart == -1 || jsonEnd == -1 || jsonStart > jsonEnd) {
-      throw AiStructuredOutputException(
-        'Failed to extract JSON from response',
-        provider: _providerName,
-        rawResponse: text,
-      );
-    }
-
-    final jsonStr = text.substring(jsonStart, jsonEnd + 1);
-
     final Map<String, dynamic> decoded;
-    try {
-      decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
-    } catch (e) {
-      throw AiStructuredOutputException(
-        'Failed to decode JSON: $e',
-        provider: _providerName,
-        rawResponse: jsonStr,
-      );
+    final String jsonStr;
+    switch (_firstJsonObject(text)) {
+      case (final json, final source):
+        decoded = json;
+        jsonStr = source;
+      case null:
+        final refused = response.finishReason == AiFinishReason.contentFilter;
+        throw AiStructuredOutputException(
+          refused
+              ? 'The model refused the request or its output was filtered '
+                  '(finish reason: contentFilter); see rawResponse'
+              : text.contains('{')
+                  ? 'Failed to decode JSON: no valid JSON object in response'
+                  : 'Failed to extract JSON from response',
+          provider: _providerName,
+          rawResponse: text,
+        );
     }
 
     try {
@@ -356,6 +383,54 @@ class AiClient {
         rawResponse: jsonStr,
       );
     }
+  }
+
+  /// Returns the first balanced `{...}` in [text] that decodes to a JSON
+  /// object, with its source, or `null`.
+  ///
+  /// Braces inside JSON strings are skipped, and each `{` is tried in turn,
+  /// so prose before or after the object (even with braces) is ignored.
+  static (Map<String, dynamic>, String)? _firstJsonObject(String text) {
+    for (var start = text.indexOf('{');
+        start != -1;
+        start = text.indexOf('{', start + 1)) {
+      final end = _matchingBrace(text, start);
+      if (end == -1) continue;
+      final source = text.substring(start, end + 1);
+      try {
+        final decoded = jsonDecode(source);
+        if (decoded is Map<String, dynamic>) return (decoded, source);
+      } on FormatException {
+        // Not JSON; try the next brace.
+      }
+    }
+    return null;
+  }
+
+  /// The index of the `}` closing the `{` at [start], or -1.
+  static int _matchingBrace(String text, int start) {
+    var depth = 0;
+    var inString = false;
+    var escaped = false;
+    for (var i = start; i < text.length; i++) {
+      final c = text[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (c == r'\') {
+          escaped = true;
+        } else if (c == '"') {
+          inString = false;
+        }
+      } else if (c == '"') {
+        inString = true;
+      } else if (c == '{') {
+        depth++;
+      } else if (c == '}') {
+        if (--depth == 0) return i;
+      }
+    }
+    return -1;
   }
 
   /// Closes the client and releases the provider's HTTP connections.
@@ -380,20 +455,36 @@ class AiClient {
   }
 
   Future<AiResponse> _executeProviderChat(AiRequest request) {
-    final future = provider.chat(request);
+    _warnIfSamplingOmitted(request);
     final timeout = this.timeout;
-    if (timeout == null) return future;
+    if (timeout == null) return provider.chat(request);
 
-    return future.timeout(
+    // A fresh trigger per attempt, combined with the caller's own trigger,
+    // so a timed-out attempt is aborted instead of running (and being
+    // billed) in the background.
+    final abort = Completer<void>();
+    void fire() {
+      if (!abort.isCompleted) abort.complete();
+    }
+
+    if (request.abortTrigger case final trigger?) {
+      unawaited(trigger.then((_) => fire(), onError: (Object _) => fire()));
+    }
+
+    return provider.chat(request.copyWith(abortTrigger: abort.future)).timeout(
       timeout,
-      onTimeout: () => throw AiTimeoutException(
-        'Request timed out after ${_describe(timeout)}',
-        provider: _providerName,
-      ),
+      onTimeout: () {
+        fire();
+        throw AiTimeoutException(
+          'Request timed out after ${_describe(timeout)}',
+          provider: _providerName,
+        );
+      },
     );
   }
 
   Stream<AiStreamChunk> _executeProviderStream(AiRequest request) {
+    _warnIfSamplingOmitted(request);
     final stream = provider.stream(request);
     final timeout = this.timeout;
     if (timeout == null) return stream;
@@ -410,6 +501,21 @@ class AiClient {
           ..close();
       },
     );
+  }
+
+  /// Logs once per model when an Anthropic model will not receive the
+  /// request's `temperature`/`topP` (see `AnthropicProvider`).
+  void _warnIfSamplingOmitted(AiRequest request) {
+    final logger = this.logger;
+    final Object provider = this.provider;
+    if (logger == null || provider is! AnthropicProvider) return;
+    if (request.temperature == null && request.topP == null) return;
+    final model = request.model ?? AnthropicProvider.defaultModel;
+    if (anthropicAcceptsSampling(model, provider.apiVersion)) return;
+    if (!_samplingWarnings.add(model)) return;
+    logger.warning('$model does not accept temperature/topP on Anthropic API '
+        'version ${provider.apiVersion}; they were omitted from the request. '
+        'This warning is shown once per model.');
   }
 
   static String _describe(Duration d) => d.inMilliseconds % 1000 == 0

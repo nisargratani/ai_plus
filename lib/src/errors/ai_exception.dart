@@ -47,7 +47,8 @@ abstract class AiException implements Exception {
 
 /// Thrown when authentication with the AI provider fails (e.g. invalid API key).
 ///
-/// Typically corresponds to HTTP 401.
+/// Typically corresponds to HTTP 401. Gemini reports an invalid key as
+/// HTTP 400 with the reason `API_KEY_INVALID`, which is mapped here too.
 class AiAuthenticationException extends AiException {
   /// Creates an [AiAuthenticationException].
   const AiAuthenticationException(
@@ -104,8 +105,9 @@ class AiNetworkException extends AiException {
 
 /// Thrown when a request to the provider times out.
 ///
-/// Raised either by the client-side `AiClient.timeout` or when the provider
-/// responds with HTTP 408.
+/// Raised by the client-side `AiClient.timeout` (which also aborts the HTTP
+/// request), when a request's `AiRequest.abortTrigger` completes, or when the
+/// provider responds with HTTP 408.
 class AiTimeoutException extends AiException {
   /// Creates an [AiTimeoutException].
   const AiTimeoutException(
@@ -133,12 +135,19 @@ class AiInvalidRequestException extends AiException {
 ///
 /// Typically corresponds to HTTP 5xx errors.
 class AiProviderException extends AiException {
+  /// The duration to wait before retrying, if provided by the provider.
+  ///
+  /// Parsed from the `retry-after` / `retry-after-ms` response headers,
+  /// which some providers send with HTTP 503 ("model overloaded").
+  final Duration? retryAfter;
+
   /// Creates an [AiProviderException].
   const AiProviderException(
     super.message, {
     super.provider,
     super.statusCode,
     super.requestId,
+    this.retryAfter,
   });
 }
 

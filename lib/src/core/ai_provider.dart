@@ -3,6 +3,7 @@ import '../http/ai_http_client.dart';
 import '../providers/anthropic/anthropic_provider.dart';
 import '../providers/custom/custom_provider.dart';
 import '../providers/gemini/gemini_provider.dart';
+import '../providers/openai/openai_api.dart';
 import '../providers/openai/openai_provider.dart';
 import 'ai_capabilities.dart';
 import 'ai_request.dart';
@@ -76,16 +77,20 @@ abstract interface class AiProvider {
   ///
   /// Pass an empty [apiKey] for servers that need no authentication, and use
   /// [headers] for non-bearer schemes such as Azure's `api-key` header.
+  /// [capabilities] describes what the server supports; it defaults to the
+  /// full OpenAI set.
   factory AiProvider.custom({
     required String baseUrl,
     required String apiKey,
     Map<String, String> headers = const {},
+    AiCapabilities capabilities = OpenAiApi.capabilities,
     AiHttpClient? httpClient,
   }) {
     return CustomProvider(
       baseUrl: baseUrl,
       apiKey: apiKey,
       headers: headers,
+      capabilities: capabilities,
       httpClient: httpClient,
     );
   }

@@ -12,6 +12,7 @@ import '../../models/ai_content.dart';
 import '../../models/ai_finish_reason.dart';
 import '../../models/ai_message.dart';
 import '../../models/ai_usage.dart';
+import '../../utils/json_utils.dart';
 import '../closeable_provider.dart';
 
 /// An AI provider implementation for the Google Gemini API.
@@ -26,6 +27,11 @@ import '../closeable_provider.dart';
 /// The API key is sent in the `x-goog-api-key` header (never in the URL).
 /// Defaults to the `gemini-flash-latest` model alias and the
 /// `gemini-embedding-001` embeddings model.
+///
+/// Usage: [AiUsage.outputTokens] includes thinking tokens
+/// (`thoughtsTokenCount`), which Gemini bills as output, and
+/// [AiUsage.inputTokens] includes `toolUsePromptTokenCount`, so input and
+/// output add up to `totalTokenCount`.
 class GeminiProvider implements AiProvider, CloseableProvider {
   /// Creates a Gemini provider.
   ///
@@ -75,6 +81,7 @@ class GeminiProvider implements AiProvider, CloseableProvider {
       headers: _headers,
       body: _buildRequestBody(request),
       provider: _provider,
+      abortTrigger: request.abortTrigger,
     );
     return _parseResponse(result);
   }
@@ -90,6 +97,7 @@ class GeminiProvider implements AiProvider, CloseableProvider {
       headers: _headers,
       body: _buildRequestBody(request),
       provider: _provider,
+      abortTrigger: request.abortTrigger,
     );
 
     await for (final payload in data) {
@@ -273,12 +281,17 @@ class GeminiProvider implements AiProvider, CloseableProvider {
             if (signature != null) 'thoughtSignature': signature,
           });
         case AiToolResultContent(:final id, :final name, :final result):
+          // Normalise through the same encoder as the other providers, so
+          // values such as DateTime use toJson()/toString() instead of
+          // breaking request encoding.
+          final Object? value =
+              result is String ? result : jsonDecode(encodeToolResult(result));
           parts.add({
             'functionResponse': {
               if (id != name) 'id': id,
               'name': name,
               'response':
-                  result is Map<String, dynamic> ? result : {'result': result},
+                  value is Map<String, dynamic> ? value : {'result': value},
             },
           });
       }
@@ -390,11 +403,19 @@ class GeminiProvider implements AiProvider, CloseableProvider {
     );
   }
 
+  /// `totalTokenCount` = prompt + tool-use prompt + thoughts + candidates.
+  /// Thinking tokens are billed as output, so they count as output here.
   static AiUsage? _parseUsage(Object? json) {
     if (json is! Map<String, dynamic>) return null;
+    int? sum(String a, String b) {
+      final x = json[a] as int?;
+      final y = json[b] as int?;
+      return x == null && y == null ? null : (x ?? 0) + (y ?? 0);
+    }
+
     return AiUsage(
-      inputTokens: json['promptTokenCount'] as int?,
-      outputTokens: json['candidatesTokenCount'] as int?,
+      inputTokens: sum('promptTokenCount', 'toolUsePromptTokenCount'),
+      outputTokens: sum('candidatesTokenCount', 'thoughtsTokenCount'),
       totalTokens: json['totalTokenCount'] as int?,
     );
   }

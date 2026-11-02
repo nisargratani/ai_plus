@@ -18,12 +18,23 @@ import '../openai/openai_api.dart';
 /// `Authorization` header when [apiKey] is empty (e.g. for a local Ollama).
 ///
 /// Always pass a `model` (per request or via `AiClient.defaultModel`); the
-/// fallback `gpt-4o-mini` rarely exists on third-party servers.
+/// fallback `gpt-6-luna` rarely exists on third-party servers.
+///
+/// Servers differ in what they implement, so describe yours with
+/// `capabilities` (by default the full OpenAI set is assumed). `AiClient`
+/// checks them before sending tools, schemas or streaming requests:
 ///
 /// ```dart
 /// final ollama = AiProvider.custom(
 ///   baseUrl: 'http://localhost:11434/v1',
 ///   apiKey: '',
+/// );
+///
+/// // A model without tools, vision or embeddings:
+/// final small = AiProvider.custom(
+///   baseUrl: 'http://localhost:11434/v1',
+///   apiKey: '',
+///   capabilities: const AiCapabilities(streaming: true),
 /// );
 ///
 /// // Azure OpenAI authenticates with an `api-key` header:
@@ -36,19 +47,21 @@ import '../openai/openai_api.dart';
 class CustomProvider implements AiProvider, CloseableProvider {
   /// Creates a provider for an OpenAI-compatible endpoint at [baseUrl].
   ///
-  /// [headers] are sent with every request. A [httpClient] passed in is not
-  /// closed by [close]; the caller owns it.
+  /// [headers] are sent with every request. [capabilities] describes what
+  /// the server supports (default: everything the OpenAI protocol offers).
+  /// A [httpClient] passed in is not closed by [close]; the caller owns it.
   CustomProvider({
     required this.baseUrl,
     required this.apiKey,
     Map<String, String> headers = const {},
+    this.capabilities = OpenAiApi.capabilities,
     AiHttpClient? httpClient,
   }) : _api = OpenAiApi(
           apiKey: apiKey,
           baseUrl: baseUrl,
           headers: headers,
           providerName: 'Custom',
-          defaultModel: 'gpt-4o-mini',
+          defaultModel: defaultModel,
           legacyMaxTokens: true,
           streamUsage: false,
           developerRole: false,
@@ -63,8 +76,12 @@ class CustomProvider implements AiProvider, CloseableProvider {
 
   final OpenAiApi _api;
 
+  /// The model used when a request does not specify one.
+  static const defaultModel = 'gpt-6-luna';
+
+  /// What the server supports, as given to the constructor.
   @override
-  AiCapabilities get capabilities => OpenAiApi.capabilities;
+  final AiCapabilities capabilities;
 
   @override
   Future<AiResponse> chat(AiRequest request) => _api.chat(request);

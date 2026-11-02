@@ -1,5 +1,6 @@
 import '../core/ai_client.dart';
 import '../core/ai_response.dart';
+import '../embeddings/embedding.dart';
 import '../embeddings/embedding_service.dart';
 import '../errors/ai_exception.dart';
 import '../models/ai_message.dart';
@@ -67,16 +68,27 @@ class AiKnowledgeBase {
     ));
   }
 
-  /// Ingests multiple text documents with a single embeddings request.
+  /// Ingests multiple text documents, embedding them [batchSize] at a time.
+  ///
+  /// Providers limit how many inputs one embeddings request may carry
+  /// (OpenAI: 2048 inputs and 300,000 tokens), so [contents] is sent in
+  /// slices of [batchSize] (default 100), in order. Lower it for long
+  /// documents. The documents are added to the store only after every slice
+  /// has been embedded, so a failed request stores none of them.
   ///
   /// When given, [ids] and [metadataList] must have the same length as
-  /// [contents]; otherwise an [ArgumentError] is thrown before any request
-  /// is made. Documents without an explicit id get a generated unique one.
+  /// [contents], and [batchSize] must be positive; otherwise an
+  /// [ArgumentError] is thrown before any request is made. Documents without
+  /// an explicit id get a generated unique one.
   Future<void> ingestBatch({
     required List<String> contents,
     List<String>? ids,
     List<Map<String, dynamic>>? metadataList,
+    int batchSize = 100,
   }) async {
+    if (batchSize <= 0) {
+      throw ArgumentError.value(batchSize, 'batchSize', 'must be positive');
+    }
     if (ids != null && ids.length != contents.length) {
       throw ArgumentError.value(
           ids, 'ids', 'must have the same length as contents');
@@ -87,13 +99,21 @@ class AiKnowledgeBase {
     }
     if (contents.isEmpty) return;
 
-    final result = await _embeddingService.createBatch(
-        inputs: contents, model: _embeddingModel);
-    if (result.embeddings.length != contents.length) {
-      throw AiParsingException(
-        'Expected ${contents.length} embeddings, '
-        'got ${result.embeddings.length}',
-      );
+    final embeddings = <AiEmbedding>[];
+    for (var start = 0; start < contents.length; start += batchSize) {
+      final end = start + batchSize < contents.length
+          ? start + batchSize
+          : contents.length;
+      final slice = contents.sublist(start, end);
+      final result = await _embeddingService.createBatch(
+          inputs: slice, model: _embeddingModel);
+      if (result.embeddings.length != slice.length) {
+        throw AiParsingException(
+          'Expected ${slice.length} embeddings, '
+          'got ${result.embeddings.length}',
+        );
+      }
+      embeddings.addAll(result.embeddings);
     }
 
     final prefix = DateTime.now().microsecondsSinceEpoch;
@@ -102,7 +122,7 @@ class AiKnowledgeBase {
         AiDocument(
           id: ids?[i] ?? '${prefix}_${_idCounter++}',
           content: contents[i],
-          embedding: result.embeddings[i],
+          embedding: embeddings[i],
           metadata: metadataList?[i] ?? const {},
         ),
     ]);

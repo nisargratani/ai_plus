@@ -23,14 +23,14 @@ Future<void> main() async {
   final metrics = MetricsMiddleware();
   final costTracker = AiCostTracker(
     pricing: const AiPricing(
-      inputCostPerToken: 0.00000015, // gpt-4o-mini pricing
-      outputCostPerToken: 0.0000006,
+      inputCostPerToken: 0.0000001, // gpt-6-luna: $0.10 per 1M input tokens
+      outputCostPerToken: 0.0000005, // $0.50 per 1M output tokens
     ),
   );
 
   final ai = AiClient(
     provider: AiProvider.openAI(apiKey: apiKey),
-    defaultModel: 'gpt-4o-mini',
+    defaultModel: 'gpt-6-luna',
     timeout: const Duration(seconds: 60),
     retryPolicy: const AiRetryPolicy(maxAttempts: 3, backoffFactor: 2.0),
     cache: MemoryAiCache(ttl: const Duration(minutes: 30), maxEntries: 100),
@@ -168,7 +168,7 @@ Future<void> _tour(
     instructions:
         'You are a weather assistant. Always use the get_weather tool.',
     tools: [weatherTool],
-    maxIterations: 3,
+    maxIterations: 3, // tool rounds; one final answer call may follow
   );
 
   try {

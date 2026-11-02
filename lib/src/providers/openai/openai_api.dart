@@ -27,6 +27,8 @@ class OpenAiApi {
   /// - [streamUsage]: request a final usage chunk via `stream_options`.
   /// - [developerRole]: send [AiMessageRole.developer] as `developer`
   ///   rather than `system`.
+  /// - [openAiModelRules]: apply rules of specific OpenAI models (for
+  ///   `gpt-6-luna`: `reasoning_effort: "none"` when tools are present).
   OpenAiApi({
     required this.apiKey,
     required this.baseUrl,
@@ -36,6 +38,7 @@ class OpenAiApi {
     this.legacyMaxTokens = false,
     this.streamUsage = true,
     this.developerRole = true,
+    this.openAiModelRules = false,
     AiHttpClient? httpClient,
   })  : _ownsHttpClient = httpClient == null,
         _httpClient = httpClient ?? AiHttpClient();
@@ -64,6 +67,9 @@ class OpenAiApi {
   /// See the constructor.
   final bool developerRole;
 
+  /// See the constructor.
+  final bool openAiModelRules;
+
   final AiHttpClient _httpClient;
   final bool _ownsHttpClient;
 
@@ -86,6 +92,7 @@ class OpenAiApi {
       headers: _headers,
       body: buildRequestBody(request),
       provider: providerName,
+      abortTrigger: request.abortTrigger,
     );
     return _parseResponse(result);
   }
@@ -94,19 +101,28 @@ class OpenAiApi {
   ///
   /// Tool-call fragments are accumulated internally and emitted as complete
   /// [AiToolCallContent]s in the chunk that carries the finish reason.
+  ///
+  /// With [streamUsage] the API sends the usage in an extra chunk right after
+  /// the one with `finish_reason`. The finishing chunk is held back until
+  /// that chunk arrives and is emitted merged with it (or at the end of the
+  /// stream if none arrives), so the last chunk carries both the finish
+  /// reason and the usage. It is not held any longer than that, so the
+  /// stream idle timeout of `AiClient` is not stretched.
   Stream<AiStreamChunk> stream(AiRequest request) async* {
     final body = buildRequestBody(request)..['stream'] = true;
     if (streamUsage) {
       body['stream_options'] = {'include_usage': true};
     }
 
-    final toolCalls = <int, _ToolCallBuilder>{};
+    final state = _StreamState();
+    AiStreamChunk? finished;
 
     await for (final data in _httpClient.postSse(
       _endpoint('chat/completions'),
       headers: _headers,
       body: body,
       provider: providerName,
+      abortTrigger: request.abortTrigger,
     )) {
       if (data == '[DONE]') break;
 
@@ -129,15 +145,34 @@ class OpenAiApi {
         );
       }
 
-      final chunk = _parseStreamChunk(json, toolCalls);
-      if (chunk != null) yield chunk;
+      final chunk = _parseStreamChunk(json, state);
+      final held = finished;
+      if (held != null) {
+        finished = null;
+        yield _merge(held, chunk);
+      } else if (streamUsage && chunk.finishReason != null) {
+        finished = chunk;
+      } else {
+        yield chunk;
+      }
     }
 
-    // Some compatible servers end the stream without a finish reason.
-    if (toolCalls.isNotEmpty) {
-      yield AiStreamChunk(content: _drainToolCalls(toolCalls));
+    if (finished != null) {
+      yield finished;
+    } else if (state.toolCalls.isNotEmpty) {
+      // Some compatible servers end the stream without a finish reason.
+      yield AiStreamChunk(content: _drainToolCalls(state.toolCalls));
     }
   }
+
+  /// Folds [next] (normally the usage-only chunk) into [finished].
+  static AiStreamChunk _merge(AiStreamChunk finished, AiStreamChunk next) =>
+      AiStreamChunk(
+        content: [...finished.content, ...next.content],
+        finishReason: next.finishReason ?? finished.finishReason,
+        usage: next.usage ?? finished.usage,
+        raw: next.raw ?? finished.raw,
+      );
 
   /// Creates embeddings for [inputs].
   Future<AiEmbeddingResult> embeddings(
@@ -222,6 +257,12 @@ class OpenAiApi {
     final tools = request.tools;
     if (tools != null && tools.isNotEmpty) {
       body['tools'] = [for (final t in tools) t.toJson()];
+      // gpt-6-luna supports function calling in Chat Completions only with
+      // reasoning_effort "none"; its default effort is "medium".
+      final model = body['model'] as String;
+      if (openAiModelRules && model.startsWith('gpt-6-luna')) {
+        body['reasoning_effort'] = 'none';
+      }
     }
 
     final schema = request.schema;
@@ -387,13 +428,15 @@ class OpenAiApi {
       }
 
       final choice = choices.first as Map<String, dynamic>;
-      final message =
-          _parseAssistantMessage(choice['message'] as Map<String, dynamic>);
+      final messageJson = choice['message'] as Map<String, dynamic>;
+      final message = _parseAssistantMessage(messageJson);
 
       return AiResponse(
         message: message,
-        finishReason: _parseFinishReason(choice['finish_reason']) ??
-            AiFinishReason.unknown,
+        finishReason: _isRefusal(messageJson)
+            ? AiFinishReason.contentFilter
+            : _parseFinishReason(choice['finish_reason']) ??
+                AiFinishReason.unknown,
         usage: _parseUsage(json['usage']) ?? AiUsage.empty,
         raw: json,
       );
@@ -408,10 +451,23 @@ class OpenAiApi {
     }
   }
 
+  /// A refusal comes as `refusal` text with no `content`.
+  static bool _isRefusal(Map<String, dynamic> message) {
+    final refusal = message['refusal'];
+    final content = message['content'];
+    return refusal is String &&
+        refusal.isNotEmpty &&
+        (content == null || content == '');
+  }
+
   AiMessage _parseAssistantMessage(Map<String, dynamic> json) {
     final parts = <AiContent>[];
 
-    final text = json['content'] as String?;
+    // A refusal is surfaced as the reply text (with finish reason
+    // contentFilter), so callers see why there is no answer.
+    final text = _isRefusal(json)
+        ? json['refusal'] as String
+        : json['content'] as String?;
     if (text != null && text.isNotEmpty) parts.add(AiTextContent(text));
 
     final toolCalls = json['tool_calls'] as List?;
@@ -429,10 +485,11 @@ class OpenAiApi {
     return AiMessage(role: AiMessageRole.assistant, content: parts);
   }
 
-  AiStreamChunk? _parseStreamChunk(
+  AiStreamChunk _parseStreamChunk(
     Map<String, dynamic> json,
-    Map<int, _ToolCallBuilder> toolCalls,
+    _StreamState state,
   ) {
+    final toolCalls = state.toolCalls;
     final usage = _parseUsage(json['usage']);
     final choices = json['choices'] as List?;
     if (choices == null || choices.isEmpty) {
@@ -446,6 +503,13 @@ class OpenAiApi {
 
     final text = delta?['content'] as String?;
     if (text != null && text.isNotEmpty) content.add(AiTextContent(text));
+
+    // Refusals stream as `refusal` deltas instead of `content`.
+    final refusal = delta?['refusal'];
+    if (refusal is String && refusal.isNotEmpty) {
+      state.refused = true;
+      content.add(AiTextContent(refusal));
+    }
 
     final toolCallDeltas = delta?['tool_calls'] as List?;
     if (toolCallDeltas != null) {
@@ -462,8 +526,11 @@ class OpenAiApi {
       }
     }
 
-    final finishReason = _parseFinishReason(choice['finish_reason']);
-    if (finishReason != null) content.addAll(_drainToolCalls(toolCalls));
+    var finishReason = _parseFinishReason(choice['finish_reason']);
+    if (finishReason != null) {
+      content.addAll(_drainToolCalls(toolCalls));
+      if (state.refused) finishReason = AiFinishReason.contentFilter;
+    }
 
     return AiStreamChunk(
       content: content,
@@ -508,6 +575,13 @@ class OpenAiApi {
         return AiFinishReason.unknown;
     }
   }
+}
+
+class _StreamState {
+  final Map<int, _ToolCallBuilder> toolCalls = {};
+
+  /// Whether the model streamed a refusal.
+  bool refused = false;
 }
 
 class _ToolCallBuilder {

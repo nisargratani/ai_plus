@@ -4,12 +4,12 @@
 /// raw model name strings when you want more structure.
 ///
 /// ```dart
-/// const gpt4o = AiModel(name: 'gpt-4o', provider: 'openai');
-/// const gemini = AiModel(name: 'gemini-2.0-flash', provider: 'gemini');
+/// const luna = AiModel(name: 'gpt-6-luna', provider: 'openai');
+/// const gemini = AiModel(name: 'gemini-flash-latest', provider: 'gemini');
 ///
 /// final response = await ai.chat(
 ///   messages: [...],
-///   model: gpt4o.name,
+///   model: luna.name,
 /// );
 /// ```
 class AiModel {
