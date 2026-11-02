@@ -1,8 +1,8 @@
 /// A lightweight template engine for constructing prompts.
 ///
 /// Supports simple variable substitution using `{{variable}}` syntax.
-/// Variables are validated at render time — missing variables throw
-/// an [ArgumentError].
+/// Whitespace inside the braces is allowed (`{{ variable }}`). Variables are
+/// validated at render time — missing variables throw an [ArgumentError].
 ///
 /// ```dart
 /// final template = AiPromptTemplate(
@@ -18,8 +18,10 @@ class AiPromptTemplate {
   /// Creates a prompt template.
   const AiPromptTemplate(this.template);
 
-  static final _variablePattern = RegExp(r'\{\{(\w+)\}\}');
-  static final _placeholderPattern = RegExp(r'\{\{([^{}]+)\}\}');
+  /// The one pattern used both to list and to substitute variables, so a
+  /// placeholder is either rendered or reported as missing, never silently
+  /// left in the output.
+  static final _variablePattern = RegExp(r'\{\{\s*(\w+)\s*\}\}');
 
   /// The set of variable names found in this template.
   Set<String> get variables =>
@@ -43,8 +45,8 @@ class AiPromptTemplate {
     }
 
     return template.replaceAllMapped(
-      _placeholderPattern,
-      (m) => values[m.group(1)!] ?? m.group(0)!,
+      _variablePattern,
+      (m) => values[m.group(1)!]!,
     );
   }
 

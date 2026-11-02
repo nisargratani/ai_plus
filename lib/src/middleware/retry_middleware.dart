@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../core/ai_request.dart';
 import '../core/ai_response.dart';
 import '../core/ai_stream.dart';
@@ -9,8 +11,10 @@ import 'ai_middleware.dart';
 /// Middleware that handles retrying requests based on an [AiRetryPolicy].
 ///
 /// Retries rate-limit (429), timeout, network and 5xx errors. The delay
-/// honours the provider's `retry-after` hint when present, capped at
-/// [AiRetryPolicy.maxDelay].
+/// honours the provider's `retry-after` hint (on 429 and 5xx responses) when
+/// present, capped at [AiRetryPolicy.maxDelay].
+///
+/// A request whose [AiRequest.abortTrigger] has completed is not retried.
 ///
 /// Streams are retried only if they fail before emitting their first chunk;
 /// once output has been delivered, replaying it would duplicate content, so
@@ -31,12 +35,15 @@ class RetryMiddleware implements AiMiddleware {
   @override
   Future<AiResponse> handleChat(
       AiRequest request, AiRequestHandler next) async {
+    final aborted = _watchAbort(request);
     var attempt = 0;
     while (true) {
       try {
         return await next(request);
       } catch (e) {
-        if (!_shouldRetry(e) || attempt >= policy.maxAttempts) rethrow;
+        if (aborted() || !_shouldRetry(e) || attempt >= policy.maxAttempts) {
+          rethrow;
+        }
         await _backoff(e, attempt++, 'Request');
       }
     }
@@ -45,6 +52,7 @@ class RetryMiddleware implements AiMiddleware {
   @override
   Stream<AiStreamChunk> handleStream(
       AiRequest request, AiStreamHandler next) async* {
+    final aborted = _watchAbort(request);
     var attempt = 0;
     while (true) {
       var emitted = false;
@@ -55,12 +63,27 @@ class RetryMiddleware implements AiMiddleware {
         }
         return;
       } catch (e) {
-        if (emitted || !_shouldRetry(e) || attempt >= policy.maxAttempts) {
+        if (emitted ||
+            aborted() ||
+            !_shouldRetry(e) ||
+            attempt >= policy.maxAttempts) {
           rethrow;
         }
         await _backoff(e, attempt++, 'Stream request');
       }
     }
+  }
+
+  /// Returns a function telling whether [request]'s abort trigger fired.
+  static bool Function() _watchAbort(AiRequest request) {
+    final trigger = request.abortTrigger;
+    if (trigger == null) return () => false;
+    var fired = false;
+    void markFired() => fired = true;
+    unawaited(trigger.then((_) => markFired(), onError: (Object _) {
+      markFired();
+    }));
+    return () => fired;
   }
 
   Future<void> _backoff(Object error, int attempt, String what) {
@@ -83,11 +106,13 @@ class RetryMiddleware implements AiMiddleware {
   }
 
   Duration _getRetryDelay(Object error, int attempt) {
-    if (error is AiRateLimitException) {
-      final retryAfter = error.retryAfter;
-      if (retryAfter != null) {
-        return retryAfter > policy.maxDelay ? policy.maxDelay : retryAfter;
-      }
+    final retryAfter = switch (error) {
+      AiRateLimitException(:final retryAfter) => retryAfter,
+      AiProviderException(:final retryAfter) => retryAfter,
+      _ => null,
+    };
+    if (retryAfter != null) {
+      return retryAfter > policy.maxDelay ? policy.maxDelay : retryAfter;
     }
     return policy.calculateDelay(attempt);
   }

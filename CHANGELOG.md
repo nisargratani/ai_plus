@@ -1,3 +1,179 @@
+## 0.1.0
+
+This release fixes 19 issues found in an external QA pass (2026-11-02) and
+revisits several defaults. The API only grows, so code that calls it
+compiles unchanged. Classes that override or implement `AiClient`,
+`AiConversation`, `AiAgent`, `AiHttpClient` or `AiRequest` methods need the
+new `abortTrigger` parameter. Callers can observe several behaviour changes,
+listed below, so the minor version is bumped.
+
+### Security
+
+- An API key (or any header value) containing a character that HTTP headers
+  cannot carry, such as the trailing newline of a key read from a file or a
+  pasted non-breaking or zero-width space, was printed in full in exception
+  messages and logs, and the request was retried three times. Header values
+  are now validated before sending, and the request fails at once with an
+  `AiInvalidRequestException` that names the header but not its value.
+  Network errors of unknown types are now described by type only.
+
+### Bug fixes
+
+**Anthropic**
+
+- Claude 5 models (including the default `claude-sonnet-5`) think by
+  default, and the API requires the `thinking` blocks of a tool-use turn to
+  be sent back unchanged. They were dropped, so agent and conversation tool
+  loops failed with HTTP 400. `thinking` and `redacted_thinking` blocks are
+  now kept, both from regular responses and from streams, in the first tool
+  call's `metadata` (`AnthropicProvider.thinkingMetadataKey`), and sent back
+  before the tool calls.
+- `temperature` and `topP` made the default model fail with HTTP 400. They
+  are now sent only to models that accept them; see Behaviour changes.
+
+**Gemini**
+
+- Tool results that are not JSON-encodable (for example a map holding a
+  `DateTime`) crashed request encoding with a raw `JsonUnsupportedObjectError`.
+  The 0.0.2 fix covered OpenAI and Anthropic only. Gemini now normalises tool
+  results the same way (`toJson()`, then `toString()`).
+- Usage ignored `thoughtsTokenCount` and `toolUsePromptTokenCount`, so
+  `outputTokens` and `AiCostTracker` under-reported billed output on
+  thinking models (the default included). See Behaviour changes.
+- An invalid API key (HTTP 400 with reason `API_KEY_INVALID`) raised
+  `AiInvalidRequestException`. It now raises `AiAuthenticationException`.
+
+**OpenAI and OpenAI-compatible servers**
+
+- In OpenAI streams, the finish reason came on the second-to-last chunk and
+  the usage on the last one, which then had `finishReason: null`. The two
+  are now merged, so the last chunk carries both, as the README states.
+- Refusals were returned as an empty reply with finish reason `stop`.
+  The refusal text is now the reply text, with `AiFinishReason.contentFilter`,
+  in both `chat` and `stream`. `generate` reports it.
+- `CustomProvider` claimed the full OpenAI capability set for every server.
+  The capabilities are now configurable; see New features.
+
+**Client, middleware and helpers**
+
+- A chat timeout threw `AiTimeoutException` but left the HTTP request
+  running, so the provider kept generating (and billing) abandoned
+  completions, and retries piled up. Timed-out attempts are now aborted.
+- A cache shared by several clients (or a persistent cache) served one
+  provider's or server's answer to another, because keys ignored the
+  provider. Keys now include the provider and its base URL.
+- `Retry-After` on 5xx responses (for example OpenAI's 503 "model
+  overloaded") was ignored. It is now honoured like on 429, capped at
+  `maxDelay`.
+- `AiAgent` ran the tools requested in its last iteration (side effects such
+  as a refund) and then threw without sending their results to the model.
+  It no longer runs tools whose results it cannot send back; see Behaviour
+  changes.
+- `generate` took the text from the first `{` to the last `}`, so a brace
+  after the JSON (for example in a note) broke decoding. It now decodes the
+  first balanced, valid JSON object, skipping braces inside strings.
+- `AiPromptTemplate` silently left `{{ name }}` (with spaces) unrendered.
+  Whitespace inside the braces is now allowed, and the variable is listed in
+  `variables` and checked like any other.
+- `AiKnowledgeBase.ingestBatch` sent every document in one embeddings
+  request, which OpenAI rejects above 2048 inputs. Documents are now
+  embedded in slices; see New features.
+- Request bodies that cannot be JSON-encoded raise `AiInvalidRequestException`
+  instead of a raw `JsonUnsupportedObjectError`.
+- The `AiModel` documentation used the retired `gemini-2.0-flash`.
+
+### Behaviour changes
+
+- **Default model:** OpenAI and custom providers default to `gpt-6-luna`
+  instead of `gpt-4o-mini`, which OpenAI deprecated on 2026-10-14 and removes
+  from the API on 2027-01-14. `gpt-6-luna` supports function calling in Chat
+  Completions only with `reasoning_effort: "none"`, so `OpenAiProvider` sends
+  that when a `gpt-6-luna` request has tools. Set a model explicitly if you
+  depended on the old default.
+- **Gemini usage:** `outputTokens` now includes thinking tokens
+  (`candidatesTokenCount + thoughtsTokenCount`), which Gemini bills as
+  output, and `inputTokens` includes `toolUsePromptTokenCount`. Costs from
+  `AiCostTracker` go up accordingly; input plus output now equals
+  `totalTokens`.
+- **Gemini invalid key:** raises `AiAuthenticationException` (status 400)
+  instead of `AiInvalidRequestException`.
+- **Cache keys:** the prefix changed from `ai_plus:v1:` to `ai_plus:v2:` and
+  keys include the provider and base URL. Entries written by 0.0.2 are no
+  longer found, so **persistent caches start cold** after upgrading. Old
+  entries can be deleted or left to expire.
+- **`AiAgent.maxIterations`** now limits rounds of tool execution. After the
+  last round the model gets one more call to answer; if it still asks for
+  tools, `AiToolException` is thrown without running them. A run makes at
+  most `maxIterations + 1` model calls (0.0.2 made at most `maxIterations`
+  and allowed only `maxIterations - 1` useful tool rounds).
+- **Anthropic sampling parameters:** `temperature` and `topP` are sent only
+  to Claude 3.x and Claude 4 models up to 4.6, on API versions before
+  `2026-10-21`. Other models (Claude Sonnet 5, Opus 4.7 and later, Haiku 5.5,
+  Fable and unknown model names) reject them, so they are omitted. Claude 4.x
+  models accept only one of the two per request, so when both are set only
+  `temperature` is sent. `AiClient` logs a one-time warning per model
+  through its `logger` whenever a parameter is omitted.
+- **Anthropic default `max_tokens`:** 1024 → 16000 (4096 for Claude 3.x
+  models, whose output limits are lower). Claude 5 models think by default
+  and thinking counts toward `max_tokens`, so 1024 often cut answers short.
+  It is a cap, not a charge; set `maxTokens` to limit spend.
+- **Anthropic usage:** `inputTokens` now includes prompt-cache reads and
+  writes (`cache_read_input_tokens`, `cache_creation_input_tokens`), like
+  OpenAI's and Gemini's prompt counts, so it is the whole prompt.
+- **Provider names in exceptions:** errors raised by `AiClient` and
+  `AiAgent` (timeouts, unsupported capabilities, structured output, tool
+  limit) now use the same `provider` names as HTTP errors: `OpenAI`,
+  `Gemini`, `Anthropic`, `Custom` (was `OpenAiProvider`, ...). Other
+  providers still use their type name.
+- **Timeouts:** `AiClient.timeout` aborts the HTTP request of a timed-out
+  `chat` attempt.
+- **Header validation:** header values with control or non-ASCII characters
+  are rejected before sending (see Security). Such values never reached the
+  provider before either: dart:io rejected them.
+- **`http` 1.6.0 or later** is required (was 1.2.0). http 1.2.x buffered
+  whole responses on the web, so streaming did not work there; 1.5.0 added
+  abortable requests and 1.6.0 fixed web stream cancellation. The minimum
+  Dart SDK is still 3.4.
+
+### New features
+
+- **Cancellation:** `abortTrigger` parameter on `AiClient.chat`, `stream`,
+  `streamText` and `generate`, `AiConversation.send` and `stream`, and
+  `AiAgent.run`. Completing the future aborts the HTTP request or response
+  stream and fails the call with `AiTimeoutException`; it is not retried, a
+  conversation's history is left unchanged, and an agent starts no further
+  tools. It reaches middleware and providers as `AiRequest.abortTrigger`
+  (not part of the cache key); `AiHttpClient.post`, `postStream` and
+  `postSse` accept it too.
+- `AiUsage.reasoningTokens` (OpenAI `reasoning_tokens`, Gemini
+  `thoughtsTokenCount`) and `AiUsage.cachedInputTokens` (OpenAI
+  `cached_tokens`, Gemini `cachedContentTokenCount`, Anthropic
+  `cache_read_input_tokens`), as parts of `outputTokens` and `inputTokens`.
+  `AiUsage.toString` lists all counts.
+- `AiPricing.cachedInputCostPerToken` and
+  `AiCostTracker.totalCachedInputTokens`: cached input is charged at its own
+  rate when one is set.
+- `AiProviderException.retryAfter`, parsed from `retry-after` /
+  `retry-after-ms` on 5xx responses.
+- `capabilities` parameter on `CustomProvider` and `AiProvider.custom`
+  (default: the full OpenAI set). `AiClient` checks it before sending tools
+  or streaming, and `generate` falls back to prompt-based JSON when
+  `structuredOutput` is false.
+- `CacheMiddleware(cache, namespace:)` and
+  `CacheMiddleware.cacheKey(request, namespace:)`. `AiClient` sets the
+  namespace automatically.
+- `AiKnowledgeBase.ingestBatch(batchSize:)` (default 100). Documents are
+  stored only after every slice has been embedded.
+- `AnthropicProvider.thinkingMetadataKey`,
+  `AnthropicProvider.legacyDefaultMaxTokens`, `OpenAiProvider.defaultModel`
+  and `CustomProvider.defaultModel`.
+
+### Documentation
+
+- README snippets that did not compile (the provider-switching example
+  redeclared `ai`; the middleware example called an undefined function) are
+  fixed.
+
 ## 0.0.2
 
 This release fixes a number of correctness and security issues found in a

@@ -226,7 +226,7 @@ void main() {
                 mimeType: 'image/png', bytes: Uint8List(4)..[0] = byte),
           ]));
       expect(withImage(1), isNot(withImage(2)));
-      expect(base, startsWith('ai_plus:v1:'));
+      expect(base, startsWith('ai_plus:v2:'));
     });
 
     test('serves repeated requests from the cache', () async {

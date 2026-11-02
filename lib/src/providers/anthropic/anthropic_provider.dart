@@ -14,6 +14,7 @@ import '../../models/ai_message.dart';
 import '../../models/ai_usage.dart';
 import '../../utils/json_utils.dart';
 import '../closeable_provider.dart';
+import 'anthropic_sampling.dart';
 
 /// An AI provider implementation for Anthropic (Claude).
 ///
@@ -25,8 +26,29 @@ import '../closeable_provider.dart';
 /// final provider = AiProvider.anthropic(apiKey: 'sk-ant-...');
 /// ```
 ///
-/// Defaults to the `claude-sonnet-5` model and `max_tokens: 1024` (the
-/// Messages API requires an explicit output limit).
+/// Defaults to the `claude-sonnet-5` model and `max_tokens: 16000` (the
+/// Messages API requires an explicit output limit; Claude 3.x models get
+/// [legacyDefaultMaxTokens]). `max_tokens` caps the whole output, thinking
+/// included, and Claude 5 models think by default, so the default leaves
+/// room for both. Set `maxTokens` to cap spend more tightly.
+///
+/// **Thinking:** when the model thinks before calling tools, its `thinking`
+/// and `redacted_thinking` blocks are stored verbatim in the metadata of the
+/// turn's first [AiToolCallContent] (under [thinkingMetadataKey]) and sent
+/// back unchanged with the tool results, as the API requires. Keep
+/// [AiToolCallContent.metadata] when persisting conversations.
+///
+/// **Sampling parameters:** `temperature` and `topP` are sent only to models
+/// that accept them (Claude 3.x and Claude 4 up to 4.6, on API versions
+/// before `2026-10-21`). Newer models, including the default, reject them
+/// with HTTP 400, so they are omitted. Claude 4.x models accept only one of
+/// the two, so when both are set only `temperature` is sent. `AiClient`
+/// logs a one-time warning when a parameter is omitted.
+///
+/// **Usage:** [AiUsage.inputTokens] includes prompt-cache reads and writes
+/// (`cache_read_input_tokens`, `cache_creation_input_tokens`), like the
+/// other providers' prompt counts; [AiUsage.cachedInputTokens] holds the
+/// cache reads.
 class AnthropicProvider implements AiProvider, CloseableProvider {
   /// Creates an Anthropic provider.
   ///
@@ -50,7 +72,19 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
   static const defaultModel = 'claude-sonnet-5';
 
   /// The `max_tokens` used when a request does not specify one.
-  static const defaultMaxTokens = 1024;
+  ///
+  /// It includes thinking tokens. Every Claude 4.5 and later model accepts
+  /// at least 64K output tokens.
+  static const defaultMaxTokens = 16000;
+
+  /// The `max_tokens` used for Claude 3.x models when a request does not
+  /// specify one (Claude 3 Haiku allows at most 4096).
+  static const legacyDefaultMaxTokens = 4096;
+
+  /// The [AiToolCallContent.metadata] key holding the `thinking` and
+  /// `redacted_thinking` blocks of a tool-use turn, as a list of the raw
+  /// JSON blocks in their original order.
+  static const thinkingMetadataKey = 'anthropic.thinking';
 
   static const _provider = 'Anthropic';
 
@@ -88,6 +122,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       headers: _headers,
       body: _buildRequestBody(request),
       provider: _provider,
+      abortTrigger: request.abortTrigger,
     );
     return _parseResponse(result);
   }
@@ -102,6 +137,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       headers: _headers,
       body: body,
       provider: _provider,
+      abortTrigger: request.abortTrigger,
     )) {
       final Map<String, dynamic> json;
       try {
@@ -148,9 +184,22 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
         .map((m) => m.text)
         .join('\n');
 
+    final model = request.model ?? defaultModel;
+    final sampling = anthropicSamplingToSend(
+      model,
+      apiVersion,
+      temperature: request.temperature != null,
+      topP: request.topP != null,
+    );
+
     final body = <String, dynamic>{
-      'model': request.model ?? defaultModel,
-      'max_tokens': request.maxTokens ?? defaultMaxTokens,
+      'model': model,
+      'max_tokens': request.maxTokens ??
+          anthropicDefaultMaxTokens(
+            model,
+            defaultMaxTokens: defaultMaxTokens,
+            legacyMaxTokens: legacyDefaultMaxTokens,
+          ),
       'messages': [
         for (final m in request.messages)
           if (m.role != AiMessageRole.system &&
@@ -158,8 +207,8 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
             _mapMessage(m),
       ],
       if (system.isNotEmpty) 'system': system,
-      if (request.temperature != null) 'temperature': request.temperature,
-      if (request.topP != null) 'top_p': request.topP,
+      if (sampling.temperature) 'temperature': request.temperature,
+      if (sampling.topP) 'top_p': request.topP,
       if (request.stop != null) 'stop_sequences': request.stop,
     };
 
@@ -204,6 +253,9 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       return {
         'role': role,
         'content': [
+          // Thinking blocks must be sent back complete and unmodified,
+          // before the tool_use blocks they accompanied.
+          if (role == 'assistant') ..._thinkingBlocks(toolCalls),
           if (text.isNotEmpty) {'type': 'text', 'text': text},
           for (final tc in toolCalls)
             {
@@ -230,6 +282,17 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
     }
 
     return {'role': role, 'content': message.text};
+  }
+
+  static List<Map<String, dynamic>> _thinkingBlocks(
+    List<AiToolCallContent> toolCalls,
+  ) {
+    return [
+      for (final call in toolCalls)
+        if (call.metadata[thinkingMetadataKey] case final List<dynamic> blocks)
+          for (final block in blocks)
+            if (block is Map) Map<String, dynamic>.from(block),
+    ];
   }
 
   Map<String, dynamic>? _mapContent(AiContent content) {
@@ -268,6 +331,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       // An empty `content` array is valid (e.g. an immediate stop sequence).
       final blocks = (json['content'] as List?) ?? const [];
       final content = <AiContent>[];
+      final thinking = <Map<String, dynamic>>[];
 
       for (final block in blocks.cast<Map<String, dynamic>>()) {
         switch (block['type']) {
@@ -280,8 +344,12 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
               name: block['name'] as String,
               arguments: (block['input'] as Map<String, dynamic>?) ?? {},
             ));
+          case 'thinking':
+          case 'redacted_thinking':
+            thinking.add(Map<String, dynamic>.of(block));
         }
       }
+      _attachThinking(content, thinking);
 
       final usageJson = json['usage'] as Map<String, dynamic>?;
       return AiResponse(
@@ -291,12 +359,7 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
         ),
         finishReason:
             _parseFinishReason(json['stop_reason']) ?? AiFinishReason.unknown,
-        usage: usageJson != null
-            ? _usage(
-                usageJson['input_tokens'] as int?,
-                usageJson['output_tokens'] as int?,
-              )
-            : AiUsage.empty,
+        usage: usageJson != null ? _usage(usageJson) : AiUsage.empty,
         raw: json,
       );
     } catch (e) {
@@ -308,6 +371,32 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
     }
   }
 
+  /// Stores [thinking] on the first tool call in [content], which is where
+  /// [_mapMessage] looks for it. Thinking is only needed for tool-use turns.
+  static void _attachThinking(
+    List<AiContent> content,
+    List<Map<String, dynamic>> thinking,
+  ) {
+    if (thinking.isEmpty) return;
+    final index = content.indexWhere((c) => c is AiToolCallContent);
+    if (index < 0) return;
+    content[index] = _withThinking(
+      content[index] as AiToolCallContent,
+      thinking,
+    );
+  }
+
+  static AiToolCallContent _withThinking(
+    AiToolCallContent call,
+    List<Map<String, dynamic>> thinking,
+  ) =>
+      AiToolCallContent(
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+        metadata: {...call.metadata, thinkingMetadataKey: thinking},
+      );
+
   AiStreamChunk? _parseStreamEvent(
     Map<String, dynamic> json,
     _StreamState state,
@@ -316,16 +405,26 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
       case 'message_start':
         final message = json['message'] as Map<String, dynamic>?;
         final usage = message?['usage'] as Map<String, dynamic>?;
-        state.inputTokens = usage?['input_tokens'] as int?;
+        if (usage != null) state.usage.addAll(usage);
         return null;
 
       case 'content_block_start':
         final block = json['content_block'] as Map<String, dynamic>?;
-        if (block?['type'] == 'tool_use') {
-          state.toolCalls[json['index'] as int] = _ToolUseBuilder(
-            id: block!['id'] as String? ?? '',
-            name: block['name'] as String? ?? '',
-          );
+        final index = json['index'];
+        if (index is! int) return null;
+        switch (block?['type']) {
+          case 'tool_use':
+            state.toolCalls[index] = _ToolUseBuilder(
+              id: block!['id'] as String? ?? '',
+              name: block['name'] as String? ?? '',
+            );
+          case 'thinking':
+            state.thinkingBlocks[index] = _ThinkingBuilder()
+              ..text.write(block!['thinking'] as String? ?? '')
+              ..signature.write(block['signature'] as String? ?? '');
+          case 'redacted_thinking':
+            state.thinkingBlocks[index] =
+                _ThinkingBuilder(redacted: Map<String, dynamic>.of(block!));
         }
         return null;
 
@@ -339,25 +438,43 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
           case 'input_json_delta':
             state.toolCalls[json['index']]?.json
                 .write(delta!['partial_json'] as String? ?? '');
+          case 'thinking_delta':
+            state.thinkingBlocks[json['index']]?.text
+                .write(delta!['thinking'] as String? ?? '');
+          case 'signature_delta':
+            state.thinkingBlocks[json['index']]?.signature
+                .write(delta!['signature'] as String? ?? '');
         }
         return null;
 
       case 'content_block_stop':
+        final thinking = state.thinkingBlocks.remove(json['index']);
+        if (thinking != null) {
+          state.thinking.add(thinking.build());
+          return null;
+        }
         final builder = state.toolCalls.remove(json['index']);
         if (builder == null) return null;
-        return AiStreamChunk(content: [builder.build()], raw: json);
+        var call = builder.build();
+        if (!state.thinkingAttached && state.thinking.isNotEmpty) {
+          call = _withThinking(call, List.of(state.thinking));
+          state.thinkingAttached = true;
+        }
+        return AiStreamChunk(content: [call], raw: json);
 
       case 'message_delta':
         final delta = json['delta'] as Map<String, dynamic>?;
         final usageJson = json['usage'] as Map<String, dynamic>?;
+        if (usageJson != null) {
+          // Cumulative counts; fields it leaves out (usually the input
+          // counts) keep their message_start values.
+          usageJson.forEach((key, value) {
+            if (value != null) state.usage[key] = value;
+          });
+        }
         return AiStreamChunk(
           finishReason: _parseFinishReason(delta?['stop_reason']),
-          usage: usageJson != null
-              ? _usage(
-                  (usageJson['input_tokens'] as int?) ?? state.inputTokens,
-                  usageJson['output_tokens'] as int?,
-                )
-              : null,
+          usage: usageJson != null ? _usage(state.usage) : null,
           raw: json,
         );
 
@@ -384,11 +501,23 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
     }
   }
 
-  static AiUsage _usage(int? input, int? output) => AiUsage(
-        inputTokens: input,
-        outputTokens: output,
-        totalTokens: (input ?? 0) + (output ?? 0),
-      );
+  /// Anthropic's `input_tokens` excludes prompt-cache reads and writes;
+  /// they are added so [AiUsage.inputTokens] is the whole prompt.
+  static AiUsage _usage(Map<String, dynamic> json) {
+    final uncached = json['input_tokens'] as int?;
+    final cacheWrite = json['cache_creation_input_tokens'] as int?;
+    final cacheRead = json['cache_read_input_tokens'] as int?;
+    final output = json['output_tokens'] as int?;
+    final input = uncached == null && cacheWrite == null && cacheRead == null
+        ? null
+        : (uncached ?? 0) + (cacheWrite ?? 0) + (cacheRead ?? 0);
+    return AiUsage(
+      inputTokens: input,
+      outputTokens: output,
+      totalTokens: (input ?? 0) + (output ?? 0),
+      cachedInputTokens: cacheRead,
+    );
+  }
 
   static AiFinishReason? _parseFinishReason(Object? reason) {
     switch (reason) {
@@ -411,8 +540,37 @@ class AnthropicProvider implements AiProvider, CloseableProvider {
 }
 
 class _StreamState {
-  int? inputTokens;
+  /// Usage fields from message_start, updated by message_delta.
+  final Map<String, dynamic> usage = {};
   final Map<int, _ToolUseBuilder> toolCalls = {};
+
+  /// Thinking blocks still being streamed, by content block index.
+  final Map<int, _ThinkingBuilder> thinkingBlocks = {};
+
+  /// Completed thinking blocks, in order.
+  final List<Map<String, dynamic>> thinking = [];
+
+  /// Whether [thinking] was attached to an emitted tool call.
+  bool thinkingAttached = false;
+}
+
+/// Reassembles a `thinking` block from `thinking_delta` and
+/// `signature_delta` events, or holds a `redacted_thinking` block verbatim.
+class _ThinkingBuilder {
+  _ThinkingBuilder({this.redacted});
+
+  final Map<String, dynamic>? redacted;
+  final StringBuffer text = StringBuffer();
+  final StringBuffer signature = StringBuffer();
+
+  // Same key order as the non-streaming API response.
+  Map<String, dynamic> build() =>
+      redacted ??
+      {
+        'type': 'thinking',
+        'thinking': text.toString(),
+        'signature': signature.toString(),
+      };
 }
 
 class _ToolUseBuilder {

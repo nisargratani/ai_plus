@@ -60,17 +60,21 @@ Future<void> main() async {
 Switch providers by changing one line:
 
 ```dart
-final ai = AiClient(provider: AiProvider.gemini(apiKey: geminiKey));
-final ai = AiClient(provider: AiProvider.anthropic(apiKey: anthropicKey));
+final gemini = AiClient(provider: AiProvider.gemini(apiKey: geminiKey));
+final claude = AiClient(provider: AiProvider.anthropic(apiKey: anthropicKey));
 
-// Local Ollama (no key needed)
-final ai = AiClient(
-  provider: AiProvider.custom(baseUrl: 'http://localhost:11434/v1', apiKey: ''),
+// Local Ollama (no key needed). Describe what the model supports:
+final ollama = AiClient(
+  provider: AiProvider.custom(
+    baseUrl: 'http://localhost:11434/v1',
+    apiKey: '',
+    capabilities: const AiCapabilities(streaming: true, toolCalling: true),
+  ),
   defaultModel: 'llama3.2',
 );
 
 // Azure OpenAI (key in an `api-key` header)
-final ai = AiClient(
+final azure = AiClient(
   provider: AiProvider.custom(
     baseUrl: 'https://my-resource.openai.azure.com/openai/v1',
     apiKey: '',
@@ -91,8 +95,11 @@ final ai = AiClient(
 | Anthropic Claude | ✅ | ✅ | ✅ | ✅ via prompt | ❌ | ✅ | ❌ |
 | Custom (OpenAI-compatible) | ✅ | ✅ | ✅ | ✅ native* | ✅* | ✅* | ❌ |
 
-\* Depends on what the server implements. Check `provider.capabilities` at
-runtime.
+\* Depends on what the server implements. Describe it with the
+`capabilities` parameter of `AiProvider.custom` (by default the full OpenAI
+set is assumed), and read it back from `provider.capabilities` at runtime.
+`AiClient` refuses tools and streaming the provider does not support, and
+`generate` falls back to prompt-based JSON when `structuredOutput` is false.
 
 **Default models** are used when neither the request nor
 `AiClient.defaultModel` names one. Set a model explicitly in production so
@@ -100,10 +107,29 @@ upgrades never change it:
 
 | Provider | Chat | Embeddings |
 |----------|------|------------|
-| OpenAI | `gpt-4o-mini` | `text-embedding-3-small` |
+| OpenAI | `gpt-6-luna` | `text-embedding-3-small` |
 | Gemini | `gemini-flash-latest` | `gemini-embedding-001` |
-| Anthropic | `claude-sonnet-5` (`max_tokens` 1024) | — |
-| Custom | `gpt-4o-mini` (always set a model) | `text-embedding-3-small` |
+| Anthropic | `claude-sonnet-5` (`max_tokens` 16000, thinking included; 4096 for Claude 3.x) | — |
+| Custom | `gpt-6-luna` (always set a model) | `text-embedding-3-small` |
+
+Provider notes:
+
+- **OpenAI:** `gpt-6-luna` supports function calling in Chat Completions only
+  with `reasoning_effort: "none"`, so `OpenAiProvider` sends that whenever a
+  `gpt-6-luna` request includes tools.
+- **Anthropic thinking:** Claude 5 models think by default. When the model
+  thinks before calling a tool, its `thinking` blocks are kept in
+  `AiToolCallContent.metadata` and sent back unchanged with the tool results,
+  as the API requires. `max_tokens` covers thinking and answer together;
+  the default of 16000 leaves room for both, and you can lower `maxTokens`
+  to cap spend.
+- **Anthropic sampling:** Claude Sonnet 5, Opus 4.7 and later, Haiku 5.5 and
+  Fable reject `temperature` and `top_p` (HTTP 400), as does every model on
+  API version `2026-10-21` or later. For those models `AnthropicProvider`
+  omits `temperature`/`topP`, and `AiClient` logs a one-time warning per
+  model through its `logger`. Older models still receive them, except that
+  Claude 4.x accepts only one of the two per request: when both are set,
+  only `temperature` is sent.
 
 Every factory accepts optional `headers` (sent with every request) and
 `httpClient`. The concrete classes (`OpenAiProvider`, `GeminiProvider`,
@@ -128,10 +154,13 @@ await for (final text in ai.streamText(messages: [AiMessage.user('Hello')])) {
 
 Stream semantics are the same for all providers:
 
-- `chunk.finishReason` is `null` on every chunk except the last one.
+- `chunk.finishReason` is `null` on every chunk except the last one. With
+  OpenAI, the last chunk also carries the usage.
 - Tool calls arrive once, with complete arguments.
 - `chunk.usage` (when the provider reports it) holds cumulative totals.
 - Breaking out of `await for` cancels the HTTP request.
+- An OpenAI refusal arrives as text, and the last chunk's `finishReason` is
+  `contentFilter`.
 
 ### Conversations
 
@@ -193,8 +222,12 @@ final answer = await agent.run('Should I bring an umbrella to London?');
 ```
 
 The agent calls the model, runs any requested tools (in parallel), feeds the
-results back, and repeats until the model answers without calling a tool. If
-that doesn't happen within `maxIterations`, it throws `AiToolException`.
+results back, and repeats until the model answers without calling a tool.
+`maxIterations` limits the rounds of tool execution. After the last round the
+results go back to the model once more so it can answer, so a run makes at
+most `maxIterations + 1` model calls. If the model still asks for tools then,
+the agent throws `AiToolException` **without** running them, so no tool side
+effect (such as a refund) happens unless its result reaches the model.
 
 ### Structured output
 
@@ -219,8 +252,10 @@ final profile = await ai.generate<Map<String, dynamic>>(
 - **Gemini:** the schema is sent as `responseSchema`.
 - **Anthropic:** the schema is added to the prompt as an instruction.
 
-If no valid JSON object can be extracted, or `decoder` throws,
-`generate` throws `AiStructuredOutputException`.
+The first valid JSON object in the reply is decoded. Text or braces around it
+are ignored. If there is no valid JSON object, the model refused (OpenAI
+`refusal`), or `decoder` throws, `generate` throws
+`AiStructuredOutputException`; its `rawResponse` holds the reply.
 
 ### Images and audio
 
@@ -255,6 +290,9 @@ final kb = AiKnowledgeBase(client: ai);
 await kb.ingest(id: 'doc1', content: 'Dart was created by Google in 2011.');
 await kb.ingest(id: 'doc2', content: 'Flutter uses Dart for cross-platform apps.');
 
+// Many documents: embedded `batchSize` (default 100) per request.
+await kb.ingestBatch(contents: faqEntries, batchSize: 100);
+
 final hits = await kb.search('Who created Dart?');
 final answer = await kb.ask('What is Dart used for?');
 print(answer.text);
@@ -282,24 +320,46 @@ final ai = AiClient(
 
 - **Retries:** rate limits (429), timeouts, network errors and 5xx responses
   are retried with exponential backoff and jitter. The provider's
-  `retry-after` hint is honoured, capped at `maxDelay`. A stream is retried
-  only if it fails before its first chunk, so output is never duplicated.
-- **Timeout:** for `chat`, the timeout applies to each attempt. For `stream`,
-  it is an idle timeout between chunks.
-- **Cache:** keys are SHA-256 digests of the whole request (model,
-  parameters, tools, schema, all message content including images). Streams
-  are not cached. Implement `AiCache` for persistent storage.
+  `retry-after` hint (on 429 and on 5xx, such as OpenAI's 503 "overloaded")
+  is honoured, capped at `maxDelay`. A stream is retried only if it fails
+  before its first chunk, so output is never duplicated. Invalid requests,
+  including an API key with a stray newline, are not retried.
+- **Timeout:** for `chat`, the timeout applies to each attempt, and an attempt
+  that times out is aborted, so the provider stops generating (and billing)
+  it. For `stream`, it is an idle timeout between chunks, and a stream that
+  times out is cancelled.
+- **Cache:** keys are SHA-256 digests of the provider and its base URL plus
+  the whole request (model, parameters, tools, schema, all message content
+  including images). One cache can therefore be shared by clients for
+  different providers or servers. Streams are not cached. Implement `AiCache`
+  for persistent storage.
 - **Logging:** only metadata and latency are logged, never message content
   or API keys.
+
+**Cancelling a request:** pass an `abortTrigger` to `chat`, `stream`,
+`generate`, `conversation.send`/`stream` or `agent.run`. When the future
+completes, the HTTP request (or response stream) is aborted and the call
+fails with `AiTimeoutException`; it is not retried, and an agent starts no
+further tools.
+
+```dart
+final cancel = Completer<void>();
+final reply = ai.chat(messages: messages, abortTrigger: cancel.future);
+// Later, for example when the user leaves the screen:
+cancel.complete();
+```
+
+Breaking out of `await for` cancels a stream as well. Middleware sees the
+trigger as `AiRequest.abortTrigger`.
 
 Custom middleware extends `AiMiddleware` and overrides what it needs:
 
 ```dart
-class AuditMiddleware extends AiMiddleware {
+class UsageMiddleware extends AiMiddleware {
   @override
   Future<AiResponse> handleChat(AiRequest request, AiRequestHandler next) async {
     final response = await next(request);
-    audit(request.model, response.usage);
+    print('${request.model ?? 'default model'}: ${response.usage.totalTokens} tokens');
     return response;
   }
 }
@@ -313,8 +373,10 @@ const template = AiPromptTemplate('Summarize this {{language}} code:\n\n{{code}}
 final prompt = template.render({'language': 'Dart', 'code': source});
 ```
 
-Substitution happens in a single pass. A `{{placeholder}}` inside an inserted
-value is left untouched, so user input cannot pull in other variables.
+Whitespace inside the braces is allowed (`{{ language }}`). A placeholder
+without a value throws `ArgumentError`. Substitution happens in a single
+pass. A `{{placeholder}}` inside an inserted value is left untouched, so user
+input cannot pull in other variables.
 
 ### Cost tracking
 
@@ -323,12 +385,19 @@ final tracker = AiCostTracker(
   pricing: const AiPricing(
     inputCostPerToken: 0.0000025, // $2.50 per 1M tokens
     outputCostPerToken: 0.00001, // $10 per 1M tokens
+    cachedInputCostPerToken: 0.00000025, // optional: prompt-cache reads
   ),
 );
 
 tracker.addUsage(response.usage);
 print('Total cost: \$${tracker.estimatedCost.toStringAsFixed(4)}');
 ```
+
+`AiUsage` is normalised across providers. `inputTokens` is the whole prompt,
+including tokens served from the provider's prompt cache (also reported as
+`cachedInputTokens`). `outputTokens` includes reasoning/thinking tokens,
+which providers bill as output (also reported as `reasoningTokens` where the
+provider gives them). So `inputTokens + outputTokens` matches `totalTokens`.
 
 ### Conversation storage
 
@@ -342,7 +411,8 @@ final restored = ai.conversation(id: conversation.id, initialMessages: messages 
 ```
 
 When persisting tool calls, keep `AiToolCallContent.metadata`. Gemini
-requires its `thoughtSignature` to be sent back.
+requires its `thoughtSignature` to be sent back, and Anthropic its `thinking`
+blocks (stored under `AnthropicProvider.thinkingMetadataKey`).
 
 ---
 
@@ -368,18 +438,18 @@ try {
 
 | Exception | When |
 |-----------|------|
-| `AiAuthenticationException` | Invalid API key (401) |
+| `AiAuthenticationException` | Invalid API key (401, or Gemini's 400 `API_KEY_INVALID`) |
 | `AiAuthorizationException` | Insufficient permissions (403) |
 | `AiRateLimitException` | Rate limited (429); `retryAfter` from response headers |
-| `AiTimeoutException` | Client-side timeout, or HTTP 408 |
+| `AiTimeoutException` | Client-side timeout, aborted request (`abortTrigger`), or HTTP 408 |
 | `AiNetworkException` | Connection failed or dropped |
-| `AiInvalidRequestException` | Other 4xx (bad parameters, unknown model, ...) |
-| `AiProviderException` | Server error (5xx) or error event inside a stream |
+| `AiInvalidRequestException` | Other 4xx (bad parameters, unknown model, ...), or a header value (such as an API key) or body that cannot be sent |
+| `AiProviderException` | Server error (5xx; `retryAfter` when sent) or error event inside a stream |
 | `AiParsingException` | Unexpected response format |
 | `AiContentFilterException` | Prompt blocked by the provider's safety system |
 | `AiUnsupportedCapabilityException` | Feature not supported by the provider |
 | `AiStructuredOutputException` | JSON extraction or decoding failed in `generate` |
-| `AiToolException` | Agent did not finish within `maxIterations` |
+| `AiToolException` | Agent still requested tools after `maxIterations` tool rounds |
 
 All errors, validation errors included, are delivered through the returned
 `Future` or `Stream`.
@@ -400,7 +470,9 @@ All errors, validation errors included, are delivered through the returned
   apps, route requests through your own backend, and point `baseUrl` at it.
 - API keys are sent only in request headers (Gemini uses `x-goog-api-key`).
   They are never put in URLs, never logged, and never included in exception
-  messages.
+  messages. A key with characters that HTTP headers cannot carry (such as the
+  trailing newline of a key read from a file) is rejected with an
+  `AiInvalidRequestException` that names the header but not its value.
 - `response.raw` and `AiParsingException.rawResponse` contain provider
   payloads. Treat them as sensitive.
 
@@ -437,6 +509,25 @@ tests.
 - Provider-specific features beyond the common surface (for example
   reasoning-effort settings or prompt caching) are not exposed as typed
   options.
+
+## Migrating to 0.1.0
+
+0.1.0 only adds to the 0.0.2 API, but some behaviour changes.
+The full list is in the [changelog](CHANGELOG.md):
+
+- Default OpenAI and custom model: `gpt-4o-mini` → `gpt-6-luna`. The old
+  model is deprecated and leaves the API on 2027-01-14.
+- Gemini `outputTokens` include thinking tokens.
+- An invalid Gemini key raises `AiAuthenticationException`.
+- `AiAgent` makes one final model call after `maxIterations` tool rounds, and
+  never runs tools it cannot report back.
+- Cache keys changed (prefix `ai_plus:v2:`), so persistent caches start cold.
+- Anthropic omits `temperature`/`topP` for models that reject them (and
+  `topP` when both are set on Claude 4.x), its default `max_tokens` is 16000
+  (4096 for Claude 3.x), and its `inputTokens` include prompt-cache tokens.
+- Exceptions raised by `AiClient` name built-in providers `OpenAI`,
+  `Gemini`, `Anthropic` or `Custom`, like HTTP errors do.
+- `http` 1.6.0 or later is required.
 
 ## Migrating from 0.0.1
 
